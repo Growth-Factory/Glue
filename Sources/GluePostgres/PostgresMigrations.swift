@@ -1,8 +1,27 @@
 import PostgresNIO
 import GlueMemory
+import Logging
 
 /// DDL migrations for Glue's PostgreSQL schema.
 public enum PostgresMigrations: Sendable {
+    /// Run all migrations using a pooled ``PostgresClient``.
+    public static func migrate(client: PostgresClient) async throws {
+        try await client.withConnection { conn in
+            try await migrate(connection: conn)
+        }
+    }
+
+    /// Create a vector index using a pooled ``PostgresClient``.
+    public static func createVectorIndex(
+        client: PostgresClient,
+        dimensions: Int,
+        indexType: VectorIndexType = .default
+    ) async throws {
+        try await client.withConnection { conn in
+            try await createVectorIndex(connection: conn, dimensions: dimensions, indexType: indexType)
+        }
+    }
+
     /// Run all migrations on the given connection.
     public static func migrate(connection: PostgresConnection) async throws {
         // Enable pgvector extension

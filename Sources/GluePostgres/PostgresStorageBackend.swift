@@ -4,47 +4,68 @@ import PostgresNIO
 import Logging
 
 /// PostgreSQL + pgvector implementation of `StorageBackend`.
+///
+/// Uses ``PostgresClient`` for connection pooling, making it safe for
+/// concurrent use in Vapor and other server environments.
 public actor PostgresStorageBackend: StorageBackend {
-    private let config: PostgresConfig
+    private let client: PostgresClient
+    private let config: PostgresConfig?
     private let logger: Logger
-    private var connection: PostgresConnection?
+    private var runTask: Task<Void, Never>?
 
+    /// Create a backend from configuration. The actor owns the pool lifecycle.
     public init(config: PostgresConfig, logger: Logger = Logger(label: "glue.postgres")) {
         self.config = config
         self.logger = logger
+        self.client = PostgresClient(
+            configuration: config.clientConfiguration,
+            backgroundLogger: logger
+        )
+    }
+
+    /// Create a backend from an externally-managed ``PostgresClient``.
+    /// Use this when your application (e.g. Vapor) already owns a pool.
+    /// The caller is responsible for calling `client.run()` and shutdown.
+    public init(client: PostgresClient, logger: Logger = Logger(label: "glue.postgres")) {
+        self.config = nil
+        self.logger = logger
+        self.client = client
     }
 
     // MARK: - Lifecycle
 
     public func initialize() async throws {
-        let conn = try await PostgresConnection.connect(
-            configuration: config.connectionConfig,
-            id: 1,
-            logger: logger
-        )
-        self.connection = conn
-        try await PostgresMigrations.migrate(connection: conn)
+        // Only start the run loop if we own the client (config-based init)
+        if config != nil {
+            let client = self.client
+            self.runTask = Task {
+                await client.run()
+            }
+        }
+
+        try await client.withConnection { conn in
+            try await PostgresMigrations.migrate(connection: conn)
+        }
     }
 
     public func shutdown() async throws {
-        try await connection?.close()
-        connection = nil
+        runTask?.cancel()
+        runTask = nil
     }
 
     // MARK: - Frame CRUD
 
     public func storeFrame(_ frame: MemoryFrame) async throws {
-        let conn = try requireConnection()
         let metadataJSON = try String(data: JSONEncoder().encode(frame.metadata), encoding: .utf8) ?? "{}"
 
         if let embedding = frame.embedding {
             let vecLiteral = vectorLiteral(embedding)
-            try await conn.query(
+            try await client.query(
                 "INSERT INTO glue_frames (id, content, metadata, embedding, created_at, updated_at) VALUES (\(frame.id), \(frame.content), \(metadataJSON)::jsonb, \(unescaped: vecLiteral)::vector, \(frame.createdAt), \(frame.updatedAt))",
                 logger: logger
             )
         } else {
-            try await conn.query(
+            try await client.query(
                 "INSERT INTO glue_frames (id, content, metadata, created_at, updated_at) VALUES (\(frame.id), \(frame.content), \(metadataJSON)::jsonb, \(frame.createdAt), \(frame.updatedAt))",
                 logger: logger
             )
@@ -61,8 +82,7 @@ public actor PostgresStorageBackend: StorageBackend {
     }
 
     public func fetchFrame(id: UUID) async throws -> MemoryFrame? {
-        let conn = try requireConnection()
-        let rows = try await conn.query(
+        let rows = try await client.query(
             "SELECT id, content, metadata::text, created_at, updated_at FROM glue_frames WHERE id = \(id)",
             logger: logger
         )
@@ -73,17 +93,16 @@ public actor PostgresStorageBackend: StorageBackend {
     }
 
     public func updateFrame(_ frame: MemoryFrame) async throws {
-        let conn = try requireConnection()
         let metadataJSON = try String(data: JSONEncoder().encode(frame.metadata), encoding: .utf8) ?? "{}"
 
         if let embedding = frame.embedding {
             let vecLiteral = vectorLiteral(embedding)
-            try await conn.query(
+            try await client.query(
                 "UPDATE glue_frames SET content = \(frame.content), metadata = \(metadataJSON)::jsonb, embedding = \(unescaped: vecLiteral)::vector, updated_at = \(frame.updatedAt) WHERE id = \(frame.id)",
                 logger: logger
             )
         } else {
-            try await conn.query(
+            try await client.query(
                 "UPDATE glue_frames SET content = \(frame.content), metadata = \(metadataJSON)::jsonb, updated_at = \(frame.updatedAt) WHERE id = \(frame.id)",
                 logger: logger
             )
@@ -91,8 +110,7 @@ public actor PostgresStorageBackend: StorageBackend {
     }
 
     public func deleteFrame(id: UUID) async throws {
-        let conn = try requireConnection()
-        try await conn.query(
+        try await client.query(
             "DELETE FROM glue_frames WHERE id = \(id)",
             logger: logger
         )
@@ -100,10 +118,9 @@ public actor PostgresStorageBackend: StorageBackend {
 
     public func deleteFrames(ids: [UUID]) async throws {
         guard !ids.isEmpty else { return }
-        let conn = try requireConnection()
-        // Delete using ANY(array)
+        // Delete using individual queries
         for id in ids {
-            try await conn.query(
+            try await client.query(
                 "DELETE FROM glue_frames WHERE id = \(id)",
                 logger: logger
             )
@@ -111,8 +128,6 @@ public actor PostgresStorageBackend: StorageBackend {
     }
 
     public func listFrames(metadata: [String: String]?) async throws -> [MemoryFrame] {
-        let conn = try requireConnection()
-
         if let metadata, !metadata.isEmpty {
             // Build parameterized metadata conditions
             // Validate keys are alphanumeric+underscore only
@@ -125,14 +140,14 @@ public actor PostgresStorageBackend: StorageBackend {
                 conditions.append("metadata->>'\(key)' = '\(value.replacingOccurrences(of: "'", with: "''"))'")
             }
             sql += conditions.joined(separator: " AND ")
-            let rows = try await conn.query(PostgresQuery(unsafeSQL: sql), logger: logger)
+            let rows = try await client.query(PostgresQuery(unsafeSQL: sql), logger: logger)
             var frames: [MemoryFrame] = []
             for try await row in rows {
                 frames.append(try decodeFrame(row))
             }
             return frames
         } else {
-            let rows = try await conn.query(
+            let rows = try await client.query(
                 "SELECT id, content, metadata::text, created_at, updated_at FROM glue_frames",
                 logger: logger
             )
@@ -147,8 +162,7 @@ public actor PostgresStorageBackend: StorageBackend {
     // MARK: - Text Search
 
     public func textSearch(query: String, topK: Int) async throws -> [TextSearchResult] {
-        let conn = try requireConnection()
-        let rows = try await conn.query(
+        let rows = try await client.query(
             "SELECT id, content, ts_rank(to_tsvector('english', content), plainto_tsquery('english', \(query))) AS rank FROM glue_frames WHERE to_tsvector('english', content) @@ plainto_tsquery('english', \(query)) ORDER BY rank DESC LIMIT \(topK)",
             logger: logger
         )
@@ -165,7 +179,6 @@ public actor PostgresStorageBackend: StorageBackend {
         guard !filters.isEmpty else {
             return try await textSearch(query: query, topK: topK)
         }
-        let conn = try requireConnection()
         var sql = "SELECT id, content, ts_rank(to_tsvector('english', content), plainto_tsquery('english', '\(query.replacingOccurrences(of: "'", with: "''"))')) AS rank FROM glue_frames WHERE to_tsvector('english', content) @@ plainto_tsquery('english', '\(query.replacingOccurrences(of: "'", with: "''"))')"
 
         for filter in filters {
@@ -173,7 +186,7 @@ public actor PostgresStorageBackend: StorageBackend {
         }
         sql += " ORDER BY rank DESC LIMIT \(topK)"
 
-        let rows = try await conn.query(PostgresQuery(unsafeSQL: sql), logger: logger)
+        let rows = try await client.query(PostgresQuery(unsafeSQL: sql), logger: logger)
         var results: [TextSearchResult] = []
         for try await row in rows {
             let (id, content, rank) = try row.decode((UUID, String, Float).self, context: .default)
@@ -185,9 +198,8 @@ public actor PostgresStorageBackend: StorageBackend {
     // MARK: - Vector Search
 
     public func vectorSearch(embedding: [Float], topK: Int) async throws -> [SearchResult] {
-        let conn = try requireConnection()
         let vecStr = vectorLiteral(embedding)
-        let rows = try await conn.query(
+        let rows = try await client.query(
             PostgresQuery(unsafeSQL: """
                 SELECT id, content,
                        1 - (embedding <=> '\(vecStr)'::vector) AS similarity
@@ -211,7 +223,6 @@ public actor PostgresStorageBackend: StorageBackend {
         guard !filters.isEmpty else {
             return try await vectorSearch(embedding: embedding, topK: topK)
         }
-        let conn = try requireConnection()
         let vecStr = vectorLiteral(embedding)
         var sql = """
             SELECT id, content,
@@ -224,7 +235,7 @@ public actor PostgresStorageBackend: StorageBackend {
         }
         sql += " ORDER BY embedding <=> '\(vecStr)'::vector LIMIT \(topK)"
 
-        let rows = try await conn.query(PostgresQuery(unsafeSQL: sql), logger: logger)
+        let rows = try await client.query(PostgresQuery(unsafeSQL: sql), logger: logger)
         var results: [SearchResult] = []
         for try await row in rows {
             let (id, content, similarity) = try row.decode((UUID, String, Float).self, context: .default)
@@ -236,7 +247,6 @@ public actor PostgresStorageBackend: StorageBackend {
     // MARK: - Structured Memory
 
     public func storeFact(_ fact: StructuredFact) async throws {
-        let conn = try requireConnection()
         let (valueType, valueData) = encodeFactValue(fact.value)
 
         let evidenceFrameId: UUID? = fact.evidence?.frameId
@@ -244,15 +254,14 @@ public actor PostgresStorageBackend: StorageBackend {
         let rangeStart: Date? = fact.timeRange?.start
         let rangeEnd: Date? = fact.timeRange?.end
 
-        try await conn.query(
+        try await client.query(
             "INSERT INTO glue_facts (id, entity, predicate, value_type, value_data, evidence_frame_id, evidence_excerpt, time_range_start, time_range_end, created_at, updated_at) VALUES (\(fact.id), \(fact.entity.rawValue), \(fact.predicate.rawValue), \(valueType), \(valueData), \(evidenceFrameId), \(evidenceExcerpt), \(rangeStart), \(rangeEnd), \(fact.createdAt), \(fact.updatedAt))",
             logger: logger
         )
     }
 
     public func fetchFacts(entity: EntityKey) async throws -> [StructuredFact] {
-        let conn = try requireConnection()
-        let rows = try await conn.query(
+        let rows = try await client.query(
             "SELECT id, entity, predicate, value_type, value_data, evidence_frame_id, evidence_excerpt, time_range_start, time_range_end, created_at, updated_at FROM glue_facts WHERE entity = \(entity.rawValue)",
             logger: logger
         )
@@ -265,8 +274,7 @@ public actor PostgresStorageBackend: StorageBackend {
     }
 
     public func fetchFacts(entity: EntityKey, predicate: PredicateKey) async throws -> [StructuredFact] {
-        let conn = try requireConnection()
-        let rows = try await conn.query(
+        let rows = try await client.query(
             "SELECT id, entity, predicate, value_type, value_data, evidence_frame_id, evidence_excerpt, time_range_start, time_range_end, created_at, updated_at FROM glue_facts WHERE entity = \(entity.rawValue) AND predicate = \(predicate.rawValue)",
             logger: logger
         )
@@ -279,26 +287,23 @@ public actor PostgresStorageBackend: StorageBackend {
     }
 
     public func deleteFact(id: UUID) async throws {
-        let conn = try requireConnection()
-        try await conn.query(
+        try await client.query(
             "DELETE FROM glue_facts WHERE id = \(id)",
             logger: logger
         )
     }
 
     public func updateFact(_ fact: StructuredFact) async throws {
-        let conn = try requireConnection()
         let (valueType, valueData) = encodeFactValue(fact.value)
 
-        try await conn.query(
+        try await client.query(
             "UPDATE glue_facts SET value_type = \(valueType), value_data = \(valueData), updated_at = \(fact.updatedAt) WHERE id = \(fact.id)",
             logger: logger
         )
     }
 
     public func listEntities() async throws -> [EntityKey] {
-        let conn = try requireConnection()
-        let rows = try await conn.query(
+        let rows = try await client.query(
             "SELECT DISTINCT entity FROM glue_facts ORDER BY entity",
             logger: logger
         )
@@ -312,13 +317,6 @@ public actor PostgresStorageBackend: StorageBackend {
     }
 
     // MARK: - Private Helpers
-
-    private func requireConnection() throws -> PostgresConnection {
-        guard let conn = connection else {
-            throw GlueError.backendError("PostgreSQL connection not initialized. Call initialize() first.")
-        }
-        return conn
-    }
 
     private func vectorLiteral(_ v: [Float]) -> String {
         "[" + v.map { String($0) }.joined(separator: ",") + "]"

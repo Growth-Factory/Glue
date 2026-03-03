@@ -11,6 +11,8 @@ public struct PostgresConfig: Sendable {
     public let database: String
     public let tls: PostgresConnection.Configuration.TLS
     public let vectorIndexType: VectorIndexType
+    public let minConnections: Int
+    public let maxConnections: Int
 
     public init(
         host: String = "localhost",
@@ -19,7 +21,9 @@ public struct PostgresConfig: Sendable {
         password: String? = nil,
         database: String = "glue",
         tls: PostgresConnection.Configuration.TLS = .disable,
-        vectorIndexType: VectorIndexType = .default
+        vectorIndexType: VectorIndexType = .default,
+        minConnections: Int = 0,
+        maxConnections: Int = 20
     ) {
         self.host = host
         self.port = port
@@ -28,6 +32,8 @@ public struct PostgresConfig: Sendable {
         self.database = database
         self.tls = tls
         self.vectorIndexType = vectorIndexType
+        self.minConnections = minConnections
+        self.maxConnections = maxConnections
     }
 
     /// Parse from a PostgreSQL connection URL.
@@ -46,7 +52,7 @@ public struct PostgresConfig: Sendable {
     }
 
     var connectionConfig: PostgresConnection.Configuration {
-        let config = PostgresConnection.Configuration(
+        PostgresConnection.Configuration(
             host: host,
             port: port,
             username: username,
@@ -54,6 +60,20 @@ public struct PostgresConfig: Sendable {
             database: database,
             tls: tls
         )
+    }
+
+    /// Build a ``PostgresClient.Configuration`` with connection pooling options.
+    public var clientConfiguration: PostgresClient.Configuration {
+        var config = PostgresClient.Configuration(
+            host: host,
+            port: port,
+            username: username,
+            password: password,
+            database: database,
+            tls: .disable
+        )
+        config.options.minimumConnections = minConnections
+        config.options.maximumConnections = maxConnections
         return config
     }
 }
