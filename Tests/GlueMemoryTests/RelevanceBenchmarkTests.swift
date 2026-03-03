@@ -985,6 +985,379 @@ struct LLMEnhancedBenchmark {
     }
 }
 
+// MARK: - Adversarial & Edge Case Benchmarks
+
+/// An LLM that returns the same generic filler for every document.
+struct UselessSurrogateEnhancer: LLMEnhancer {
+    func generateSurrogate(_ text: String, maxTokens: Int) async throws -> String {
+        "This is a document. It contains information. Very relevant content."
+    }
+    func expandQuery(_ query: String) async throws -> [String] { [query] }
+}
+
+/// An LLM that hallucinates wrong-topic keywords — actively harmful.
+struct HallucinatingSurrogateEnhancer: LLMEnhancer {
+    func generateSurrogate(_ text: String, maxTokens: Int) async throws -> String {
+        if text.contains("Sarah Chen, CEO") {
+            // Hallucinates financial keywords onto team slide
+            return "Keywords: revenue, ARR, burn rate, runway, profitability, unit economics, financials"
+        }
+        if text.contains("Launched 12 months ago") {
+            // Hallucinates team keywords onto traction slide
+            return "Keywords: team, founders, CEO, CTO, leadership, executive, co-founders"
+        }
+        if text.contains("Enterprises spend $340B") {
+            // Hallucinates solution keywords onto problem slide
+            return "Keywords: middleware, adapter, API, SDK, bridge agents, translation layer"
+        }
+        return ""
+    }
+    func expandQuery(_ query: String) async throws -> [String] { [query] }
+}
+
+/// An LLM that returns an absurdly long surrogate — wall of text.
+struct VerboseSurrogateEnhancer: LLMEnhancer {
+    func generateSurrogate(_ text: String, maxTokens: Int) async throws -> String {
+        // 200 words of generic startup jargon — same for every doc
+        let filler = Array(repeating: "growth revenue team market product traction investors funding startup enterprise SaaS platform scalable innovative disruptive solution problem opportunity", count: 15).joined(separator: " ")
+        return filler
+    }
+    func expandQuery(_ query: String) async throws -> [String] { [query] }
+}
+
+/// An LLM that expands queries with off-topic noise.
+struct NoisyQueryExpander: LLMEnhancer {
+    func generateSurrogate(_ text: String, maxTokens: Int) async throws -> String { "" }
+    func expandQuery(_ query: String) async throws -> [String] {
+        // Original query + 3 garbage expansions
+        return [
+            query,
+            "banana orange apple fruit smoothie recipe kitchen",
+            "football soccer basketball championship league standings",
+            "weather forecast sunny cloudy temperature humidity",
+        ]
+    }
+}
+
+/// An LLM that throws errors intermittently.
+struct FailingSurrogateEnhancer: LLMEnhancer {
+    var failOnContent: String
+    func generateSurrogate(_ text: String, maxTokens: Int) async throws -> String {
+        if text.contains(failOnContent) {
+            throw GlueError.backendError("LLM API rate limited")
+        }
+        return ""
+    }
+    func expandQuery(_ query: String) async throws -> [String] { [query] }
+}
+
+@Suite("Adversarial LLM Benchmark")
+struct AdversarialLLMBenchmark {
+
+    // MARK: - Bad Surrogates
+
+    /// A useless LLM that returns generic filler should not hurt results.
+    /// BM25 should still work because the original content is preserved.
+    @Test func uselessSurrogatesDoNoHarm() async throws {
+        let config = OrchestratorConfig(
+            enableTextSearch: true,
+            enableVectorSearch: false,
+            enableSurrogateGeneration: true
+        )
+
+        // Run engineering corpus with useless surrogates
+        let withSurrogates = try await runBenchmark(
+            corpus: engineeringCorpus,
+            queries: engineeringQueries,
+            llmEnhancer: UselessSurrogateEnhancer(),
+            config: config
+        )
+
+        // Run without surrogates as baseline
+        let baseline = try await runBenchmark(
+            corpus: engineeringCorpus,
+            queries: engineeringQueries
+        )
+
+        let baselineHitRate = baseline.filter { !$0.expectedHits.isEmpty }
+            .reduce(0.0) { $0 + $1.hitRate } / Double(baseline.filter { !$0.expectedHits.isEmpty }.count)
+        let surrogateHitRate = withSurrogates.filter { !$0.expectedHits.isEmpty }
+            .reduce(0.0) { $0 + $1.hitRate } / Double(withSurrogates.filter { !$0.expectedHits.isEmpty }.count)
+
+        // Useless surrogates add the same words to every doc — should not change ranking
+        #expect(surrogateHitRate >= baselineHitRate - 0.05,
+                "Useless surrogates should not significantly degrade results. Baseline: \(String(format: "%.1f%%", baselineHitRate * 100)), With surrogates: \(String(format: "%.1f%%", surrogateHitRate * 100))")
+    }
+
+    /// A hallucinating LLM that puts wrong-topic keywords on documents.
+    /// This is the worst case: it should actively confuse the search.
+    /// We test that the damage is at least bounded — not a total meltdown.
+    @Test func hallucinatingSurrogatesCauseMeasurableDamage() async throws {
+        let config = OrchestratorConfig(
+            enableTextSearch: true,
+            enableVectorSearch: false,
+            enableSurrogateGeneration: true
+        )
+
+        // Specifically test the 3 documents that get wrong keywords
+        let queries = [
+            // "financials" keywords hallucinated onto team slide — does "burn rate" now match team?
+            BenchmarkQuery("burn rate runway profitability LTV CAC unit economics",
+                           hits: ["financials"]),
+            // "team" keywords hallucinated onto traction slide — does "founders CEO" now match traction?
+            BenchmarkQuery("who is on the team founders leadership",
+                           hits: ["team"]),
+            // "solution" keywords hallucinated onto problem slide — does "middleware adapter" now match problem?
+            BenchmarkQuery("middleware adapter framework REST GraphQL gRPC protocol translation",
+                           hits: ["solution"]),
+        ]
+
+        let results = try await runBenchmark(
+            corpus: pitchDeckCorpus,
+            queries: queries,
+            llmEnhancer: HallucinatingSurrogateEnhancer(),
+            config: config
+        )
+
+        // Count how many got confused
+        var confused = 0
+        for r in results {
+            if let first = r.topResults.first, !r.expectedHits.contains(first.key) {
+                confused += 1
+            }
+        }
+
+        // Report honestly — hallucination can break things
+        // The test documents the damage rather than pretending it's fine
+        print("Hallucinating LLM: \(confused)/\(results.count) queries returned wrong #1 result")
+        // But the correct doc should still appear somewhere in top-K
+        let hitRate = results.reduce(0.0) { $0 + $1.hitRate } / Double(results.count)
+        #expect(hitRate >= 0.5,
+                "Even with hallucinating surrogates, correct doc should appear in top-K at least 50% of the time. Got \(String(format: "%.0f%%", hitRate * 100))")
+    }
+
+    /// Verbose surrogates that drown the original content with identical jargon
+    /// on every document. BM25 scores should flatten since every doc now shares
+    /// the same terms — effectively destroying discrimination.
+    @Test func verboseSurrogatesFlattenScores() async throws {
+        let config = OrchestratorConfig(
+            enableTextSearch: true,
+            enableVectorSearch: false,
+            enableSurrogateGeneration: true
+        )
+
+        let results = try await runBenchmark(
+            corpus: engineeringCorpus,
+            queries: engineeringQueries,
+            llmEnhancer: VerboseSurrogateEnhancer(),
+            config: config
+        )
+
+        let baseline = try await runBenchmark(
+            corpus: engineeringCorpus,
+            queries: engineeringQueries
+        )
+
+        // Measure score spread: how much does #1 outscore #3?
+        // With verbose identical surrogates, the gap should shrink
+        var baselineSpreads: [Float] = []
+        var verboseSpreads: [Float] = []
+
+        for r in baseline where r.topResults.count >= 3 {
+            baselineSpreads.append(r.topResults[0].score - r.topResults[2].score)
+        }
+        for r in results where r.topResults.count >= 3 {
+            verboseSpreads.append(r.topResults[0].score - r.topResults[2].score)
+        }
+
+        let avgBaselineSpread = baselineSpreads.reduce(0, +) / Float(max(1, baselineSpreads.count))
+        let avgVerboseSpread = verboseSpreads.reduce(0, +) / Float(max(1, verboseSpreads.count))
+
+        print("Score spread #1 vs #3 — Baseline: \(String(format: "%.2f", avgBaselineSpread)), Verbose surrogates: \(String(format: "%.2f", avgVerboseSpread))")
+
+        // The verbose surrogates should measurably reduce discrimination
+        // but not totally destroy it (original content still matters)
+        let withHits = results.filter { !$0.expectedHits.isEmpty }
+        let hitRate = withHits.reduce(0.0) { $0 + $1.hitRate } / Double(withHits.count)
+        #expect(hitRate >= 0.60,
+                "Even with verbose surrogates, hit rate should be >= 60%. Got \(String(format: "%.1f%%", hitRate * 100))")
+    }
+
+    // MARK: - Bad Query Expansion
+
+    /// Noisy query expansion adds totally off-topic search variants.
+    /// Should not hurt because the original query is always included,
+    /// and we keep best-score-per-frame during merging.
+    @Test func noisyQueryExpansionDoesNoHarm() async throws {
+        let config = OrchestratorConfig(
+            enableTextSearch: true,
+            enableVectorSearch: false,
+            enableQueryExpansion: true
+        )
+
+        let withNoise = try await runBenchmark(
+            corpus: personalCorpus,
+            queries: personalQueries,
+            llmEnhancer: NoisyQueryExpander(),
+            config: config
+        )
+
+        let baseline = try await runBenchmark(
+            corpus: personalCorpus,
+            queries: personalQueries
+        )
+
+        let baselineHitRate = baseline.filter { !$0.expectedHits.isEmpty }
+            .reduce(0.0) { $0 + $1.hitRate } / Double(baseline.filter { !$0.expectedHits.isEmpty }.count)
+        let noisyHitRate = withNoise.filter { !$0.expectedHits.isEmpty }
+            .reduce(0.0) { $0 + $1.hitRate } / Double(withNoise.filter { !$0.expectedHits.isEmpty }.count)
+
+        // Noisy expansion should not hurt because original query is always included
+        // and merge uses max-score, so garbage results just get outscored
+        #expect(noisyHitRate >= baselineHitRate,
+                "Noisy expansion must not degrade results. Baseline: \(String(format: "%.1f%%", baselineHitRate * 100)), Noisy: \(String(format: "%.1f%%", noisyHitRate * 100))")
+    }
+
+    // MARK: - Typos
+
+    /// Users make typos. BM25 is exact-match, so typos should hurt.
+    /// This test documents how badly typos degrade results.
+    @Test func typosInQueriesDegradeResults() async throws {
+        let queries = [
+            // Correct spelling vs typos
+            BenchmarkQuery("PostgreSQL vacuum failover read replica WAL backup",
+                           hits: ["database-runbook"]),      // correct — should hit
+            BenchmarkQuery("PostrgeSQL vacum failovr read repica WAL bakcup",
+                           hits: ["database-runbook"]),      // typos — will it still hit?
+
+            BenchmarkQuery("Prometheus Grafana SLO latency error rate PagerDuty",
+                           hits: ["monitoring-alerts"]),     // correct
+            BenchmarkQuery("Promethesu Grafna SLO latecy eror rate PagerDty",
+                           hits: ["monitoring-alerts"]),     // typos
+
+            BenchmarkQuery("Kafka Flink ClickHouse Airflow analytics events aggregation batch",
+                           hits: ["data-pipeline"]),         // correct
+            BenchmarkQuery("Kafak Flink ClikHouse Airfow analytcs events agregation batch",
+                           hits: ["data-pipeline"]),         // typos
+        ]
+
+        let results = try await runBenchmark(corpus: engineeringCorpus, queries: queries)
+
+        // Correct queries (even indices)
+        let correctHits = [results[0], results[2], results[4]].filter { $0.hitRate >= 1.0 }.count
+        // Typo queries (odd indices)
+        let typoHits = [results[1], results[3], results[5]].filter { $0.hitRate >= 1.0 }.count
+
+        print("Typo test — Correct queries: \(correctHits)/3 hit, Typo queries: \(typoHits)/3 hit")
+
+        #expect(correctHits == 3, "All correct-spelling queries must hit")
+        // BM25 is exact-match so typos WILL hurt — document the extent
+        // We don't require typo queries to pass; this is an honest measurement
+    }
+
+    /// Typos in ingested content (e.g., user-generated notes with mistakes).
+    @Test func typosInContentDegradeResults() async throws {
+        let cleanCorpus: [(key: String, content: String)] = [
+            ("clean-doc", "The authentication module handles user login, password hashing with bcrypt, and JWT session tokens stored in Redis."),
+        ]
+        let typoCorpus: [(key: String, content: String)] = [
+            ("typo-doc", "The authentcation modle handels user logn, pasword hashng with bcyrpt, and JWT sesion toknes stored in Rdis."),
+        ]
+
+        let cleanResults = try await runBenchmark(
+            corpus: cleanCorpus,
+            queries: [BenchmarkQuery("authentication login password bcrypt JWT session Redis", hits: ["clean-doc"])]
+        )
+        let typoResults = try await runBenchmark(
+            corpus: typoCorpus,
+            queries: [BenchmarkQuery("authentication login password bcrypt JWT session Redis", hits: ["typo-doc"])]
+        )
+
+        let cleanScore = cleanResults[0].topResults.first?.score ?? 0
+        let typoScore = typoResults[0].topResults.first?.score ?? 0
+
+        print("Content typos — Clean doc score: \(String(format: "%.2f", cleanScore)), Typo doc score: \(String(format: "%.2f", typoScore))")
+
+        #expect(cleanResults[0].hitRate >= 1.0, "Clean content must be found")
+        // Typo content will score lower but might still be found since some keywords survive
+    }
+
+    // MARK: - LLM Errors
+
+    /// LLM throws an error during ingest — remember() should propagate the error,
+    /// not silently swallow it and store without the surrogate.
+    @Test func llmErrorDuringIngestPropagates() async throws {
+        let enhancer = FailingSurrogateEnhancer(failOnContent: "Enterprises spend $340B")
+
+        let backend = InMemoryStorageBackend()
+        let orch = MemoryOrchestrator(
+            backend: backend,
+            llmEnhancer: enhancer,
+            config: OrchestratorConfig(
+                enableTextSearch: true,
+                enableVectorSearch: false,
+                enableSurrogateGeneration: true
+            )
+        )
+
+        // This content triggers the LLM failure
+        do {
+            try await orch.remember("Enterprises spend $340B annually maintaining legacy systems.")
+            #expect(Bool(false), "Should have thrown an error")
+        } catch {
+            // Expected — LLM error should propagate
+            #expect(String(describing: error).contains("rate limited"),
+                    "Error should be the LLM error, got: \(error)")
+        }
+
+        // Other content should still work
+        let frame = try await orch.remember("This content is fine and should succeed.")
+        #expect(frame.content.contains("This content is fine"))
+    }
+
+    // MARK: - Empty / Minimal Content
+
+    /// Very short content — single word, single sentence.
+    /// BM25 should still work but with fewer terms to match.
+    @Test func minimalContentStillSearchable() async throws {
+        let corpus: [(key: String, content: String)] = [
+            ("one-word", "PostgreSQL"),
+            ("short-sentence", "Use Redis for caching."),
+            ("normal", "Our deployment pipeline uses ArgoCD for continuous delivery to Kubernetes clusters."),
+        ]
+
+        let results = try await runBenchmark(corpus: corpus, queries: [
+            BenchmarkQuery("PostgreSQL", hits: ["one-word"]),
+            BenchmarkQuery("Redis caching", hits: ["short-sentence"]),
+            BenchmarkQuery("ArgoCD deployment Kubernetes", hits: ["normal"]),
+        ])
+
+        for r in results {
+            #expect(r.hitRate >= 1.0, "Even minimal content should be searchable: \"\(r.query)\"")
+        }
+    }
+
+    /// Duplicate content — same text stored multiple times.
+    /// All copies should appear in results with similar scores.
+    @Test func duplicateContentReturnsAll() async throws {
+        let corpus: [(key: String, content: String)] = [
+            ("copy-1", "The quarterly report shows revenue growth of 25% year over year."),
+            ("copy-2", "The quarterly report shows revenue growth of 25% year over year."),
+            ("copy-3", "The quarterly report shows revenue growth of 25% year over year."),
+            ("unrelated", "The cat sat on the mat and looked out the window."),
+        ]
+
+        let results = try await runBenchmark(corpus: corpus, queries: [
+            BenchmarkQuery("quarterly report revenue growth", hits: ["copy-1", "copy-2", "copy-3"], k: 5),
+        ])
+
+        let topKeys = Set(results[0].topResults.map(\.key))
+        let copies = topKeys.intersection(["copy-1", "copy-2", "copy-3"])
+        #expect(copies.count == 3, "All 3 copies should appear in top-5. Got: \(topKeys)")
+        #expect(!topKeys.contains("unrelated"), "Unrelated doc should not appear")
+    }
+}
+
 // MARK: - Aggregate Precision Benchmark
 
 @Suite("Aggregate Precision")
