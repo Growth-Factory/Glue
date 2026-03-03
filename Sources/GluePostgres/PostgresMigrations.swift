@@ -1,4 +1,5 @@
 import PostgresNIO
+import GlueMemory
 
 /// DDL migrations for Glue's PostgreSQL schema.
 public enum PostgresMigrations: Sendable {
@@ -28,6 +29,14 @@ public enum PostgresMigrations: Sendable {
         try await connection.query("""
             CREATE INDEX IF NOT EXISTS idx_glue_frames_fts
             ON glue_frames USING gin(to_tsvector('english', content))
+            """,
+            logger: .init(label: "glue.migrations")
+        )
+
+        // Content hash index for deduplication
+        try await connection.query("""
+            CREATE INDEX IF NOT EXISTS idx_glue_frames_content_hash
+            ON glue_frames ((metadata->>'_contentHash'))
             """,
             logger: .init(label: "glue.migrations")
         )
@@ -70,7 +79,8 @@ public enum PostgresMigrations: Sendable {
     /// Call this after the embedding dimensions are known.
     public static func createVectorIndex(
         connection: PostgresConnection,
-        dimensions: Int
+        dimensions: Int,
+        indexType: VectorIndexType = .default
     ) async throws {
         // Alter the embedding column to have the correct dimensions
         try await connection.query(
@@ -81,12 +91,25 @@ public enum PostgresMigrations: Sendable {
             logger: .init(label: "glue.migrations")
         )
 
-        // Create IVFFlat index for vector similarity search
-        try await connection.query("""
-            CREATE INDEX IF NOT EXISTS idx_glue_frames_embedding
-            ON glue_frames USING ivfflat (embedding vector_cosine_ops)
-            WITH (lists = 100)
-            """,
+        // Create index based on configuration
+        let indexSQL: String
+        switch indexType {
+        case .ivfflat(let lists):
+            indexSQL = """
+                CREATE INDEX IF NOT EXISTS idx_glue_frames_embedding
+                ON glue_frames USING ivfflat (embedding vector_cosine_ops)
+                WITH (lists = \(lists))
+                """
+        case .hnsw(let m, let efConstruction):
+            indexSQL = """
+                CREATE INDEX IF NOT EXISTS idx_glue_frames_embedding
+                ON glue_frames USING hnsw (embedding vector_cosine_ops)
+                WITH (m = \(m), ef_construction = \(efConstruction))
+                """
+        }
+
+        try await connection.query(
+            PostgresQuery(unsafeSQL: indexSQL),
             logger: .init(label: "glue.migrations")
         )
     }

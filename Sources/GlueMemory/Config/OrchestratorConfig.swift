@@ -29,6 +29,18 @@ public struct OrchestratorConfig: Sendable {
     /// Each variant is searched independently and results are merged by best score.
     public var enableQueryExpansion: Bool
 
+    /// BM25 text search parameters.
+    public var bm25Config: BM25Config
+
+    /// Custom token counter. When nil, the built-in `TokenCounter` is used.
+    public var tokenCounter: (any TokenCounting)?
+
+    /// Enable post-retrieval reranking of search results.
+    public var enableReranking: Bool
+
+    /// Deduplication mode for content ingestion.
+    public var deduplicationMode: DeduplicationMode
+
     public init(
         enableTextSearch: Bool = true,
         enableVectorSearch: Bool = true,
@@ -38,7 +50,11 @@ public struct OrchestratorConfig: Sendable {
         ragTokenBudget: Int = 4096,
         enableSurrogateGeneration: Bool = false,
         surrogateMaxTokens: Int = 128,
-        enableQueryExpansion: Bool = false
+        enableQueryExpansion: Bool = false,
+        bm25Config: BM25Config = BM25Config(),
+        tokenCounter: (any TokenCounting)? = nil,
+        enableReranking: Bool = false,
+        deduplicationMode: DeduplicationMode = .none
     ) {
         self.enableTextSearch = enableTextSearch
         self.enableVectorSearch = enableVectorSearch
@@ -49,5 +65,9 @@ public struct OrchestratorConfig: Sendable {
         self.enableSurrogateGeneration = enableSurrogateGeneration
         self.surrogateMaxTokens = surrogateMaxTokens
         self.enableQueryExpansion = enableQueryExpansion
+        self.bm25Config = bm25Config
+        self.tokenCounter = tokenCounter
+        self.enableReranking = enableReranking
+        self.deduplicationMode = deduplicationMode
     }
 }

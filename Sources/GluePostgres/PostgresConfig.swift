@@ -1,5 +1,6 @@
 import Foundation
 import PostgresNIO
+import GlueMemory
 
 /// Configuration for connecting to PostgreSQL.
 public struct PostgresConfig: Sendable {
@@ -9,6 +10,7 @@ public struct PostgresConfig: Sendable {
     public let password: String?
     public let database: String
     public let tls: PostgresConnection.Configuration.TLS
+    public let vectorIndexType: VectorIndexType
 
     public init(
         host: String = "localhost",
@@ -16,7 +18,8 @@ public struct PostgresConfig: Sendable {
         username: String = "postgres",
         password: String? = nil,
         database: String = "glue",
-        tls: PostgresConnection.Configuration.TLS = .disable
+        tls: PostgresConnection.Configuration.TLS = .disable,
+        vectorIndexType: VectorIndexType = .default
     ) {
         self.host = host
         self.port = port
@@ -24,6 +27,7 @@ public struct PostgresConfig: Sendable {
         self.password = password
         self.database = database
         self.tls = tls
+        self.vectorIndexType = vectorIndexType
     }
 
     /// Parse from a PostgreSQL connection URL.

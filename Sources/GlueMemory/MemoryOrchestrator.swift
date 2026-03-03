@@ -7,19 +7,26 @@ public actor MemoryOrchestrator {
     private let backend: any StorageBackend
     private let embeddingProvider: (any EmbeddingProvider)?
     private let llmEnhancer: (any LLMEnhancer)?
+    private let reranker: (any Reranker)?
+    private let metrics: (any MetricsCollector)?
     private let config: OrchestratorConfig
     private let logger: Logger
+    private let clock = ContinuousClock()
 
     public init(
         backend: any StorageBackend,
         embeddingProvider: (any EmbeddingProvider)? = nil,
         llmEnhancer: (any LLMEnhancer)? = nil,
+        reranker: (any Reranker)? = nil,
+        metrics: (any MetricsCollector)? = nil,
         config: OrchestratorConfig = OrchestratorConfig(),
         logger: Logger = Logger(label: "glue.memory")
     ) {
         self.backend = backend
         self.embeddingProvider = embeddingProvider
         self.llmEnhancer = llmEnhancer
+        self.reranker = reranker
+        self.metrics = metrics
         self.config = config
         self.logger = logger
     }
@@ -50,7 +57,34 @@ public actor MemoryOrchestrator {
         _ content: String,
         metadata: [String: String] = [:]
     ) async throws -> MemoryFrame {
+        let start = clock.now
+
         var meta = metadata
+
+        // Deduplication check
+        if config.deduplicationMode != .none {
+            let hash = contentHash(content)
+            meta["_contentHash"] = hash
+
+            let existing = try await backend.listFrames(metadata: ["_contentHash": hash])
+            if let existingFrame = existing.first {
+                switch config.deduplicationMode {
+                case .skip:
+                    if let m = metrics { await m.recordIngestLatency(clock.now - start) }
+                    return existingFrame
+                case .replace:
+                    var updated = existingFrame
+                    updated.content = content
+                    for (k, v) in meta { updated.metadata[k] = v }
+                    updated.updatedAt = Date()
+                    try await backend.updateFrame(updated)
+                    if let m = metrics { await m.recordIngestLatency(clock.now - start) }
+                    return updated
+                case .none:
+                    break
+                }
+            }
+        }
 
         // Generate surrogate summary at ingest time
         var surrogate: String?
@@ -61,27 +95,43 @@ public actor MemoryOrchestrator {
         }
 
         // Chunk long content
-        let chunks = TextChunker.chunk(content, strategy: config.chunkingStrategy)
+        let chunks = TextChunker.chunk(content, strategy: config.chunkingStrategy, tokenCounter: config.tokenCounter)
 
+        let result: MemoryFrame
         if chunks.count <= 1 {
             // Short content — store as a single frame
             let storedContent = surrogate != nil ? content + "\n\n" + surrogate! : content
-            return try await storeOneFrame(content: storedContent, metadata: meta)
+            result = try await storeOneFrame(content: storedContent, metadata: meta)
+        } else {
+            // Long content — store full content as parent frame, then each chunk
+            let parentFrame = try await storeOneFrame(content: content, metadata: meta)
+
+            for (i, chunk) in chunks.enumerated() {
+                var chunkMeta = meta
+                chunkMeta["_parentId"] = parentFrame.id.uuidString
+                chunkMeta["_chunkIndex"] = String(i)
+                let chunkContent = surrogate != nil ? chunk + "\n\n" + surrogate! : chunk
+                try await storeOneFrame(content: chunkContent, metadata: chunkMeta)
+            }
+
+            logger.debug("Stored frame \(parentFrame.id) with \(chunks.count) chunks")
+            result = parentFrame
         }
 
-        // Long content — store full content as parent frame, then each chunk
-        let parentFrame = try await storeOneFrame(content: content, metadata: meta)
+        if let m = metrics { await m.recordIngestLatency(clock.now - start) }
+        return result
+    }
 
-        for (i, chunk) in chunks.enumerated() {
-            var chunkMeta = meta
-            chunkMeta["_parentId"] = parentFrame.id.uuidString
-            chunkMeta["_chunkIndex"] = String(i)
-            let chunkContent = surrogate != nil ? chunk + "\n\n" + surrogate! : chunk
-            try await storeOneFrame(content: chunkContent, metadata: chunkMeta)
+    /// Store multiple items at once.
+    public func rememberBatch(
+        _ items: [(content: String, metadata: [String: String])]
+    ) async throws -> [MemoryFrame] {
+        var frames: [MemoryFrame] = []
+        for item in items {
+            let frame = try await remember(item.content, metadata: item.metadata)
+            frames.append(frame)
         }
-
-        logger.debug("Stored frame \(parentFrame.id) with \(chunks.count) chunks")
-        return parentFrame
+        return frames
     }
 
     /// Store a single frame with optional embedding.
@@ -92,7 +142,9 @@ public actor MemoryOrchestrator {
     ) async throws -> MemoryFrame {
         var embedding: [Float]?
         if config.enableVectorSearch, let provider = embeddingProvider {
+            let embStart = clock.now
             embedding = try await provider.embed(content)
+            if let m = metrics { await m.recordEmbeddingLatency(clock.now - embStart) }
         }
 
         let frame = MemoryFrame(
@@ -128,9 +180,11 @@ public actor MemoryOrchestrator {
     /// the query is expanded into multiple variants. Each variant is searched
     /// independently and results are merged, keeping the best score per frame.
     public func search(_ request: SearchRequest) async throws -> SearchResponse {
+        let searchStart = clock.now
         let mode = request.mode
         let topK = request.topK
         let query = request.query
+        let filters = request.filters ?? []
 
         // Expand query if enabled
         var queries = [query]
@@ -142,7 +196,7 @@ public actor MemoryOrchestrator {
         // Run search for each query variant and merge
         var bestByFrame: [UUID: SearchResult] = [:]
         for q in queries {
-            let results = try await executeSearch(query: q, mode: mode, topK: topK)
+            let results = try await executeSearch(query: q, mode: mode, topK: topK, filters: filters)
             for r in results {
                 if let existing = bestByFrame[r.frameId] {
                     if r.score > existing.score {
@@ -154,28 +208,49 @@ public actor MemoryOrchestrator {
             }
         }
 
-        let merged = Array(bestByFrame.values)
+        var merged = Array(bestByFrame.values)
             .sorted { $0.score > $1.score }
-            .prefix(topK)
+
+        // Apply reranking if enabled
+        if config.enableReranking, let reranker = self.reranker {
+            merged = try await reranker.rerank(query: query, results: merged, topK: topK)
+        }
+
+        merged = Array(merged.prefix(topK))
 
         let filtered: [SearchResult]
         if let minScore = request.minScore {
-            filtered = Array(merged).filter { $0.score >= minScore }
+            filtered = merged.filter { $0.score >= minScore }
         } else {
-            filtered = Array(merged)
+            filtered = merged
+        }
+
+        if let m = metrics {
+            await m.recordSearchLatency(clock.now - searchStart, mode: mode)
+            await m.recordSearchResultCount(filtered.count, mode: mode)
         }
 
         return SearchResponse(results: filtered, query: query)
     }
 
     /// Execute a single search query for a given mode.
-    private func executeSearch(query: String, mode: SearchMode, topK: Int) async throws -> [SearchResult] {
+    private func executeSearch(
+        query: String,
+        mode: SearchMode,
+        topK: Int,
+        filters: [MetadataFilter]
+    ) async throws -> [SearchResult] {
         switch mode {
         case .textOnly:
             guard config.enableTextSearch else {
                 throw GlueError.invalidConfiguration("Text search is disabled")
             }
-            let textResults = try await backend.textSearch(query: query, topK: topK)
+            let textResults: [TextSearchResult]
+            if filters.isEmpty {
+                textResults = try await backend.textSearch(query: query, topK: topK)
+            } else {
+                textResults = try await backend.textSearch(query: query, topK: topK, filters: filters)
+            }
             return textResults.map { SearchResult(frameId: $0.frameId, score: $0.score, content: $0.snippet) }
 
         case .vectorOnly:
@@ -186,18 +261,30 @@ public actor MemoryOrchestrator {
                 throw GlueError.embeddingProviderRequired
             }
             let queryEmbedding = try await provider.embed(query)
-            return try await backend.vectorSearch(embedding: queryEmbedding, topK: topK)
+            if filters.isEmpty {
+                return try await backend.vectorSearch(embedding: queryEmbedding, topK: topK)
+            } else {
+                return try await backend.vectorSearch(embedding: queryEmbedding, topK: topK, filters: filters)
+            }
 
         case .hybrid(let alpha):
             var textResults: [TextSearchResult] = []
             var vectorResults: [SearchResult] = []
 
             if config.enableTextSearch {
-                textResults = try await backend.textSearch(query: query, topK: topK)
+                if filters.isEmpty {
+                    textResults = try await backend.textSearch(query: query, topK: topK)
+                } else {
+                    textResults = try await backend.textSearch(query: query, topK: topK, filters: filters)
+                }
             }
             if config.enableVectorSearch, let provider = embeddingProvider {
                 let queryEmbedding = try await provider.embed(query)
-                vectorResults = try await backend.vectorSearch(embedding: queryEmbedding, topK: topK)
+                if filters.isEmpty {
+                    vectorResults = try await backend.vectorSearch(embedding: queryEmbedding, topK: topK)
+                } else {
+                    vectorResults = try await backend.vectorSearch(embedding: queryEmbedding, topK: topK, filters: filters)
+                }
             }
 
             return HybridSearch.fuse(
@@ -218,17 +305,22 @@ public actor MemoryOrchestrator {
         topK: Int? = nil,
         tokenBudget: Int? = nil
     ) async throws -> RAGContext {
+        let ragStart = clock.now
         let request = SearchRequest(
             query: query,
             mode: mode ?? config.defaultSearchMode,
             topK: topK ?? config.defaultTopK
         )
         let response = try await search(request)
-        return RAGContextBuilder.build(
+        let context = RAGContextBuilder.build(
             query: query,
             results: response.results,
-            tokenBudget: tokenBudget ?? config.ragTokenBudget
+            tokenBudget: tokenBudget ?? config.ragTokenBudget,
+            chunkingStrategy: config.chunkingStrategy,
+            tokenCounter: config.tokenCounter
         )
+        if let m = metrics { await m.recordRAGBuildLatency(clock.now - ragStart) }
+        return context
     }
 
     // MARK: - Structured Memory (Knowledge Graph)
@@ -272,5 +364,16 @@ public actor MemoryOrchestrator {
     /// List all known entities.
     public func listEntities() async throws -> [EntityKey] {
         try await backend.listEntities()
+    }
+
+    // MARK: - Private Helpers
+
+    /// Simple SHA-256-style content hash using Swift's built-in Hasher.
+    /// Produces a stable hex string for deduplication purposes.
+    private func contentHash(_ content: String) -> String {
+        var hasher = Hasher()
+        hasher.combine(content)
+        let hash = hasher.finalize()
+        return String(format: "%016x", hash)
     }
 }

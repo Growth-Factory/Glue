@@ -8,10 +8,13 @@ public actor InMemoryTextIndex: Sendable {
     private var averageDocLength: Double = 0
 
     // BM25 parameters
-    private let k1: Double = 1.2
-    private let b: Double = 0.75
+    private let k1: Double
+    private let b: Double
 
-    public init() {}
+    public init(config: BM25Config = BM25Config()) {
+        self.k1 = config.k1
+        self.b = config.b
+    }
 
     public func index(frameId: UUID, content: String) {
         // Remove old document if re-indexing

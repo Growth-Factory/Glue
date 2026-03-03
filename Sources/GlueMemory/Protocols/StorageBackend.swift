@@ -9,6 +9,9 @@ public protocol StorageBackend: Sendable {
     /// Store a new memory frame.
     func storeFrame(_ frame: MemoryFrame) async throws
 
+    /// Store multiple frames at once.
+    func storeFrames(_ frames: [MemoryFrame]) async throws
+
     /// Retrieve a frame by ID.
     func fetchFrame(id: UUID) async throws -> MemoryFrame?
 
@@ -18,6 +21,9 @@ public protocol StorageBackend: Sendable {
     /// Delete a frame by ID.
     func deleteFrame(id: UUID) async throws
 
+    /// Delete multiple frames by ID.
+    func deleteFrames(ids: [UUID]) async throws
+
     /// List all frames, optionally filtered by metadata.
     func listFrames(metadata: [String: String]?) async throws -> [MemoryFrame]
 
@@ -26,10 +32,16 @@ public protocol StorageBackend: Sendable {
     /// Full-text search returning scored results.
     func textSearch(query: String, topK: Int) async throws -> [TextSearchResult]
 
+    /// Full-text search with metadata filters.
+    func textSearch(query: String, topK: Int, filters: [MetadataFilter]) async throws -> [TextSearchResult]
+
     // MARK: - Vector Search
 
     /// Vector similarity search.
     func vectorSearch(embedding: [Float], topK: Int) async throws -> [SearchResult]
+
+    /// Vector similarity search with metadata filters.
+    func vectorSearch(embedding: [Float], topK: Int, filters: [MetadataFilter]) async throws -> [SearchResult]
 
     // MARK: - Structured Memory (Knowledge Graph)
 
@@ -58,4 +70,66 @@ public protocol StorageBackend: Sendable {
 
     /// Gracefully shut down (close connections, etc.).
     func shutdown() async throws
+}
+
+// MARK: - Default Implementations
+
+extension StorageBackend {
+    /// Default batch store: loops over individual storeFrame calls.
+    public func storeFrames(_ frames: [MemoryFrame]) async throws {
+        for frame in frames {
+            try await storeFrame(frame)
+        }
+    }
+
+    /// Default batch delete: loops over individual deleteFrame calls.
+    public func deleteFrames(ids: [UUID]) async throws {
+        for id in ids {
+            try await deleteFrame(id: id)
+        }
+    }
+
+    /// Default filtered text search: delegates to unfiltered then filters in memory.
+    public func textSearch(query: String, topK: Int, filters: [MetadataFilter]) async throws -> [TextSearchResult] {
+        let results = try await textSearch(query: query, topK: topK * 3)
+        guard !filters.isEmpty else { return Array(results.prefix(topK)) }
+        // Fetch frames to check metadata
+        var filtered: [TextSearchResult] = []
+        for result in results {
+            guard filtered.count < topK else { break }
+            if let frame = try await fetchFrame(id: result.frameId),
+               matchesFilters(frame.metadata, filters: filters) {
+                filtered.append(result)
+            }
+        }
+        return filtered
+    }
+
+    /// Default filtered vector search: delegates to unfiltered then filters in memory.
+    public func vectorSearch(embedding: [Float], topK: Int, filters: [MetadataFilter]) async throws -> [SearchResult] {
+        let results = try await vectorSearch(embedding: embedding, topK: topK * 3)
+        guard !filters.isEmpty else { return Array(results.prefix(topK)) }
+        var filtered: [SearchResult] = []
+        for result in results {
+            guard filtered.count < topK else { break }
+            if let frame = try await fetchFrame(id: result.frameId),
+               matchesFilters(frame.metadata, filters: filters) {
+                filtered.append(result)
+            }
+        }
+        return filtered
+    }
+}
+
+private func matchesFilters(_ metadata: [String: String], filters: [MetadataFilter]) -> Bool {
+    filters.allSatisfy { filter in
+        switch filter {
+        case .equals(let key, let value):
+            return metadata[key] == value
+        case .contains(let key, let value):
+            return metadata[key]?.contains(value) == true
+        case .exists(let key):
+            return metadata[key] != nil
+        }
+    }
 }

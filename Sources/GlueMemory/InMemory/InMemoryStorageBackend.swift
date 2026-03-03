@@ -4,10 +4,12 @@ import Foundation
 public actor InMemoryStorageBackend: StorageBackend {
     private var frames: [UUID: MemoryFrame] = [:]
     private var facts: [UUID: StructuredFact] = [:]
-    private let textIndex = InMemoryTextIndex()
+    private let textIndex: InMemoryTextIndex
     private let vectorIndex = InMemoryVectorIndex()
 
-    public init() {}
+    public init(bm25Config: BM25Config = BM25Config()) {
+        self.textIndex = InMemoryTextIndex(config: bm25Config)
+    }
 
     // MARK: - Frame CRUD
 
@@ -57,6 +59,21 @@ public actor InMemoryStorageBackend: StorageBackend {
         await textIndex.search(query: query, topK: topK)
     }
 
+    public func textSearch(query: String, topK: Int, filters: [MetadataFilter]) async throws -> [TextSearchResult] {
+        guard !filters.isEmpty else {
+            return try await textSearch(query: query, topK: topK)
+        }
+        let results = await textIndex.search(query: query, topK: topK * 3)
+        var filtered: [TextSearchResult] = []
+        for result in results {
+            guard filtered.count < topK else { break }
+            if let frame = frames[result.frameId], matchesFilters(frame.metadata, filters: filters) {
+                filtered.append(result)
+            }
+        }
+        return filtered
+    }
+
     // MARK: - Vector Search
 
     public func vectorSearch(embedding: [Float], topK: Int) async throws -> [SearchResult] {
@@ -65,6 +82,21 @@ public actor InMemoryStorageBackend: StorageBackend {
             guard let frame = frames[id] else { return nil }
             return SearchResult(frameId: id, score: score, content: frame.content)
         }
+    }
+
+    public func vectorSearch(embedding: [Float], topK: Int, filters: [MetadataFilter]) async throws -> [SearchResult] {
+        guard !filters.isEmpty else {
+            return try await vectorSearch(embedding: embedding, topK: topK)
+        }
+        let results = await vectorIndex.search(query: embedding, topK: topK * 3)
+        var filtered: [SearchResult] = []
+        for (id, score) in results {
+            guard filtered.count < topK else { break }
+            if let frame = frames[id], matchesFilters(frame.metadata, filters: filters) {
+                filtered.append(SearchResult(frameId: id, score: score, content: frame.content))
+            }
+        }
+        return filtered
     }
 
     // MARK: - Structured Memory
@@ -100,4 +132,19 @@ public actor InMemoryStorageBackend: StorageBackend {
 
     public func initialize() async throws {}
     public func shutdown() async throws {}
+
+    // MARK: - Private
+
+    private func matchesFilters(_ metadata: [String: String], filters: [MetadataFilter]) -> Bool {
+        filters.allSatisfy { filter in
+            switch filter {
+            case .equals(let key, let value):
+                return metadata[key] == value
+            case .contains(let key, let value):
+                return metadata[key]?.contains(value) == true
+            case .exists(let key):
+                return metadata[key] != nil
+            }
+        }
+    }
 }
