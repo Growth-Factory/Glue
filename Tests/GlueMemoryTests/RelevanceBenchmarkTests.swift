@@ -37,12 +37,15 @@ struct BenchmarkResult {
 func runBenchmark(
     corpus: [(key: String, content: String)],
     queries: [BenchmarkQuery],
-    metadata: [String: [String: String]] = [:]
+    metadata: [String: [String: String]] = [:],
+    llmEnhancer: (any LLMEnhancer)? = nil,
+    config: OrchestratorConfig = OrchestratorConfig(enableTextSearch: true, enableVectorSearch: false)
 ) async throws -> [BenchmarkResult] {
     let backend = InMemoryStorageBackend()
     let orch = MemoryOrchestrator(
         backend: backend,
-        config: OrchestratorConfig(enableTextSearch: true, enableVectorSearch: false)
+        llmEnhancer: llmEnhancer,
+        config: config
     )
 
     // Ingest
@@ -797,23 +800,233 @@ struct PitchDeckBenchmark {
     }
 }
 
+// MARK: - LLM-Enhanced Benchmarks
+
+/// A mock LLMEnhancer that returns hand-crafted surrogates.
+/// Simulates what a real LLM would generate: keywords and synonyms
+/// that aren't in the original text but match how users search.
+struct MockSurrogateEnhancer: LLMEnhancer {
+    /// Map from a substring in the content to the surrogate to append.
+    let surrogates: [String: String]
+
+    func generateSurrogate(_ text: String, maxTokens: Int) async throws -> String {
+        for (trigger, surrogate) in surrogates {
+            if text.contains(trigger) {
+                return surrogate
+            }
+        }
+        return ""
+    }
+
+    func expandQuery(_ query: String) async throws -> [String] {
+        [query]
+    }
+}
+
+/// A mock LLMEnhancer that expands queries into multiple search variants.
+struct MockQueryExpander: LLMEnhancer {
+    let expansions: [String: [String]]
+
+    func generateSurrogate(_ text: String, maxTokens: Int) async throws -> String {
+        ""
+    }
+
+    func expandQuery(_ query: String) async throws -> [String] {
+        if let expanded = expansions[query] {
+            return [query] + expanded
+        }
+        return [query]
+    }
+}
+
+@Suite("LLM-Enhanced Relevance Benchmark")
+struct LLMEnhancedBenchmark {
+
+    /// Surrogate generation fixes the 3 pitch deck rank-1 misses.
+    /// Without surrogates, BM25 can't match "team" → team slide (word "team" is diluted),
+    /// "problem" → problem slide (shares "legacy systems" with solution),
+    /// or "revenue growing" → traction (says "ARR" not "revenue").
+    @Test func surrogateGenerationFixesPitchDeckMisses() async throws {
+        let enhancer = MockSurrogateEnhancer(surrogates: [
+            // Team slide: add "team founders leadership founding members"
+            "Sarah Chen, CEO": "Keywords: team, founders, leadership, founding members, executive team, co-founders",
+            // Problem slide: add "problem pain point challenge"
+            "Enterprises spend $340B": "Keywords: problem, pain point, challenge, what problem, company solves",
+            // Traction slide: add "revenue growing traction growth"
+            "Launched 12 months ago": "Keywords: revenue, traction, growth, growing, sales, income, how fast",
+            // Advisors: reinforce "advisors advisory board"
+            "Jennifer Walsh": "Keywords: advisors, advisory board, external advisors, mentors",
+        ])
+
+        let config = OrchestratorConfig(
+            enableTextSearch: true,
+            enableVectorSearch: false,
+            enableSurrogateGeneration: true
+        )
+
+        // The 3 queries that fail at rank-1 without surrogates
+        let queries = [
+            BenchmarkQuery("who is on the team founders leadership",
+                           hits: ["team"]),
+            BenchmarkQuery("what problem does the company solve legacy systems migration",
+                           hits: ["problem"]),
+            BenchmarkQuery("what is the revenue and how fast is it growing",
+                           hits: ["traction"], k: 5),
+        ]
+
+        let results = try await runBenchmark(
+            corpus: pitchDeckCorpus,
+            queries: queries,
+            llmEnhancer: enhancer,
+            config: config
+        )
+
+        // All 3 should now hit rank-1
+        for r in results {
+            let rank1 = r.topResults.first
+            #expect(rank1 != nil && r.expectedHits.contains(rank1!.key),
+                    "Surrogate should fix rank-1 for: \"\(r.query)\" — got #1=\(rank1?.key ?? "none")")
+        }
+    }
+
+    /// Query expansion fixes misses by searching for paraphrases.
+    @Test func queryExpansionFixesPitchDeckMisses() async throws {
+        let expander = MockQueryExpander(expansions: [
+            // "team founders leadership" → also search for names on the team slide
+            "who is on the team founders leadership": [
+                "CEO CTO VP Engineering VP Sales founders",
+            ],
+            // "problem" → add terms unique to the problem slide
+            "what problem does the company solve legacy systems migration": [
+                "enterprises spend maintaining COBOL mainframes migration fail",
+            ],
+            // "revenue growing" → add ARR and traction-specific terms
+            "what is the revenue and how fast is it growing": [
+                "ARR month-over-month customers growth retention",
+            ],
+        ])
+
+        let config = OrchestratorConfig(
+            enableTextSearch: true,
+            enableVectorSearch: false,
+            enableQueryExpansion: true
+        )
+
+        let queries = [
+            BenchmarkQuery("who is on the team founders leadership",
+                           hits: ["team"]),
+            BenchmarkQuery("what problem does the company solve legacy systems migration",
+                           hits: ["problem"]),
+            BenchmarkQuery("what is the revenue and how fast is it growing",
+                           hits: ["traction"], k: 5),
+        ]
+
+        let results = try await runBenchmark(
+            corpus: pitchDeckCorpus,
+            queries: queries,
+            llmEnhancer: expander,
+            config: config
+        )
+
+        for r in results {
+            let rank1 = r.topResults.first
+            #expect(rank1 != nil && r.expectedHits.contains(rank1!.key),
+                    "Query expansion should fix rank-1 for: \"\(r.query)\" — got #1=\(rank1?.key ?? "none")")
+        }
+    }
+
+    /// Surrogates should not degrade results that already work.
+    /// Run the full pitch deck with surrogates and verify no regressions.
+    @Test func surrogatesDoNotDegradeExistingResults() async throws {
+        let enhancer = MockSurrogateEnhancer(surrogates: [
+            "Sarah Chen, CEO": "Keywords: team, founders, leadership, founding members, executive team",
+            "Enterprises spend $340B": "Keywords: problem, pain point, challenge, what problem",
+            "Launched 12 months ago": "Keywords: revenue, traction, growth, growing, how fast",
+            "Jennifer Walsh": "Keywords: advisors, advisory board, external advisors",
+            "NovaBridge is a middleware": "Keywords: solution, how it works, product approach",
+            "NovaBridge platform consists": "Keywords: product, architecture, components, SDK",
+            "Total addressable market": "Keywords: market, TAM, SAM, market size, opportunity",
+            "SaaS pricing based": "Keywords: business model, pricing, monetization, revenue model",
+            "MuleSoft": "Keywords: competition, competitors, alternatives, competitive landscape",
+            "Land-and-expand": "Keywords: go-to-market, GTM, sales strategy, distribution",
+            "Last 12 months revenue": "Keywords: financials, unit economics, burn, runway",
+            "Raising $18M": "Keywords: fundraise, ask, investment, Series A, use of funds",
+            "NovaBridge — Connecting": "Keywords: cover, title, company name",
+        ])
+
+        let config = OrchestratorConfig(
+            enableTextSearch: true,
+            enableVectorSearch: false,
+            enableSurrogateGeneration: true
+        )
+
+        let results = try await runBenchmark(
+            corpus: pitchDeckCorpus,
+            queries: pitchDeckQueries,
+            llmEnhancer: enhancer,
+            config: config
+        )
+
+        let withHits = results.filter { !$0.expectedHits.isEmpty }
+        let avgHitRate = withHits.reduce(0.0) { $0 + $1.hitRate } / Double(withHits.count)
+        #expect(avgHitRate >= 0.85,
+                "Surrogates should not degrade hit rate. Got \(String(format: "%.1f%%", avgHitRate * 100))")
+
+        // Count rank-1 hits
+        var rank1 = 0
+        for r in withHits {
+            if let first = r.topResults.first, r.expectedHits.contains(first.key) {
+                rank1 += 1
+            }
+        }
+        let rank1Pct = Double(rank1) / Double(withHits.count) * 100
+        #expect(rank1Pct >= 90.0,
+                "With surrogates, rank-1 precision should be >= 90%. Got \(rank1)/\(withHits.count) (\(String(format: "%.1f%%", rank1Pct)))")
+    }
+}
+
 // MARK: - Aggregate Precision Benchmark
 
 @Suite("Aggregate Precision")
 struct AggregatePrecisionBenchmark {
 
     @Test func overallPrecisionAcrossAllScenarios() async throws {
-        let eng = try await runBenchmark(corpus: engineeringCorpus, queries: engineeringQueries)
-        let personal = try await runBenchmark(corpus: personalCorpus, queries: personalQueries)
-        let codebase = try await runBenchmark(corpus: codebaseCorpus, queries: codebaseQueries)
-        let pitch = try await runBenchmark(corpus: pitchDeckCorpus, queries: pitchDeckQueries)
+        let scenarios: [(String, [BenchmarkResult])] = [
+            ("Engineering", try await runBenchmark(corpus: engineeringCorpus, queries: engineeringQueries)),
+            ("Personal", try await runBenchmark(corpus: personalCorpus, queries: personalQueries)),
+            ("Codebase", try await runBenchmark(corpus: codebaseCorpus, queries: codebaseQueries)),
+            ("PitchDeck", try await runBenchmark(corpus: pitchDeckCorpus, queries: pitchDeckQueries)),
+        ]
 
-        let all = eng + personal + codebase + pitch
+        let all = scenarios.flatMap(\.1)
         let withHits = all.filter { !$0.expectedHits.isEmpty }
         let totalQueries = withHits.count
         let avgHitRate = withHits.reduce(0.0) { $0 + $1.hitRate } / Double(totalQueries)
         let perfectHits = withHits.filter { $0.hitRate >= 1.0 }.count
         let noFalsePositives = all.filter { $0.missViolations.isEmpty }.count
+
+        // Rank-1 precision: expected doc is the #1 result
+        var rank1Total = 0
+        var rank1Hits = 0
+        var rank1Misses: [String] = []
+        for (name, results) in scenarios {
+            for r in results where !r.expectedHits.isEmpty {
+                rank1Total += 1
+                if let first = r.topResults.first, r.expectedHits.contains(first.key) {
+                    rank1Hits += 1
+                } else {
+                    let got = r.topResults.first.map { "\($0.key)(\(String(format: "%.1f", $0.score)))" } ?? "none"
+                    rank1Misses.append("[\(name)] \"\(r.query)\" — #1=\(got)")
+                }
+            }
+        }
+
+        let rank1Pct = Double(rank1Hits) / Double(rank1Total) * 100
+        let rank1Summary = "Rank-1 precision: \(rank1Hits)/\(rank1Total) (\(String(format: "%.1f%%", rank1Pct)))"
+        if !rank1Misses.isEmpty {
+            let detail = rank1Misses.joined(separator: "\n  ")
+            print("\(rank1Summary)\nRank-1 misses:\n  \(detail)")
+        }
 
         // Aggregate thresholds
         #expect(avgHitRate >= 0.80,
@@ -822,5 +1035,6 @@ struct AggregatePrecisionBenchmark {
                 "At least 70% of queries must have perfect hits. Got \(perfectHits)/\(totalQueries)")
         #expect(Double(noFalsePositives) / Double(all.count) >= 0.90,
                 "At least 90% of queries must have no false positives. Got \(noFalsePositives)/\(all.count)")
+        #expect(rank1Pct >= 80.0, "\(rank1Summary)")
     }
 }
