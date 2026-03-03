@@ -18,13 +18,27 @@ public struct OrchestratorConfig: Sendable {
     /// Maximum token budget for RAG context assembly.
     public var ragTokenBudget: Int
 
+    /// Generate a surrogate summary at ingest time (requires LLMEnhancer).
+    /// The surrogate is appended to the indexed content to improve keyword recall.
+    public var enableSurrogateGeneration: Bool
+
+    /// Max tokens for surrogate text generation.
+    public var surrogateMaxTokens: Int
+
+    /// Expand queries at search time into multiple variants (requires LLMEnhancer).
+    /// Each variant is searched independently and results are merged by best score.
+    public var enableQueryExpansion: Bool
+
     public init(
         enableTextSearch: Bool = true,
         enableVectorSearch: Bool = true,
         defaultSearchMode: SearchMode = .hybrid,
         defaultTopK: Int = 10,
         chunkingStrategy: ChunkingStrategy = .default,
-        ragTokenBudget: Int = 4096
+        ragTokenBudget: Int = 4096,
+        enableSurrogateGeneration: Bool = false,
+        surrogateMaxTokens: Int = 128,
+        enableQueryExpansion: Bool = false
     ) {
         self.enableTextSearch = enableTextSearch
         self.enableVectorSearch = enableVectorSearch
@@ -32,5 +46,8 @@ public struct OrchestratorConfig: Sendable {
         self.defaultTopK = defaultTopK
         self.chunkingStrategy = chunkingStrategy
         self.ragTokenBudget = ragTokenBudget
+        self.enableSurrogateGeneration = enableSurrogateGeneration
+        self.surrogateMaxTokens = surrogateMaxTokens
+        self.enableQueryExpansion = enableQueryExpansion
     }
 }
