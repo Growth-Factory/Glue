@@ -39,38 +39,68 @@ public actor MemoryOrchestrator {
     /// Store a piece of content in memory with optional metadata.
     /// Returns the created `MemoryFrame`.
     ///
+    /// Long content is automatically chunked using the configured `chunkingStrategy`.
+    /// Each chunk is stored as a separate frame with `_parentId` and `_chunkIndex`
+    /// metadata linking it back to the original. The first frame holds the full content.
+    ///
     /// If `enableSurrogateGeneration` is on and an `LLMEnhancer` is provided,
-    /// a summary/keywords are generated and stored in `metadata["_surrogate"]`.
-    /// The surrogate is appended to the content for indexing so that BM25 and
-    /// vector search can match on the generated terms too.
+    /// a summary is generated and appended to each chunk for better keyword matching.
     @discardableResult
     public func remember(
         _ content: String,
         metadata: [String: String] = [:]
     ) async throws -> MemoryFrame {
         var meta = metadata
-        var storedContent = content
 
         // Generate surrogate summary at ingest time
+        var surrogate: String?
         if config.enableSurrogateGeneration, let enhancer = llmEnhancer {
-            let surrogate = try await enhancer.generateSurrogate(content, maxTokens: config.surrogateMaxTokens)
+            surrogate = try await enhancer.generateSurrogate(content, maxTokens: config.surrogateMaxTokens)
             meta["_surrogate"] = surrogate
-            storedContent = content + "\n\n" + surrogate
-            logger.debug("Generated surrogate for content (\(surrogate.count) chars)")
+            logger.debug("Generated surrogate for content (\(surrogate!.count) chars)")
         }
 
+        // Chunk long content
+        let chunks = TextChunker.chunk(content, strategy: config.chunkingStrategy)
+
+        if chunks.count <= 1 {
+            // Short content — store as a single frame
+            let storedContent = surrogate != nil ? content + "\n\n" + surrogate! : content
+            return try await storeOneFrame(content: storedContent, metadata: meta)
+        }
+
+        // Long content — store full content as parent frame, then each chunk
+        let parentFrame = try await storeOneFrame(content: content, metadata: meta)
+
+        for (i, chunk) in chunks.enumerated() {
+            var chunkMeta = meta
+            chunkMeta["_parentId"] = parentFrame.id.uuidString
+            chunkMeta["_chunkIndex"] = String(i)
+            let chunkContent = surrogate != nil ? chunk + "\n\n" + surrogate! : chunk
+            try await storeOneFrame(content: chunkContent, metadata: chunkMeta)
+        }
+
+        logger.debug("Stored frame \(parentFrame.id) with \(chunks.count) chunks")
+        return parentFrame
+    }
+
+    /// Store a single frame with optional embedding.
+    @discardableResult
+    private func storeOneFrame(
+        content: String,
+        metadata: [String: String]
+    ) async throws -> MemoryFrame {
         var embedding: [Float]?
         if config.enableVectorSearch, let provider = embeddingProvider {
-            embedding = try await provider.embed(storedContent)
+            embedding = try await provider.embed(content)
         }
 
         let frame = MemoryFrame(
-            content: storedContent,
-            metadata: meta,
+            content: content,
+            metadata: metadata,
             embedding: embedding
         )
         try await backend.storeFrame(frame)
-        logger.debug("Stored frame \(frame.id)")
         return frame
     }
 
