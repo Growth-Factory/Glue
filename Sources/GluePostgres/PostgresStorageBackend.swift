@@ -61,7 +61,7 @@ public actor PostgresStorageBackend: StorageBackend {
         if let embedding = frame.embedding {
             let vecLiteral = vectorLiteral(embedding)
             try await client.query(
-                "INSERT INTO glue_frames (id, content, metadata, embedding, created_at, updated_at) VALUES (\(frame.id), \(frame.content), \(metadataJSON)::jsonb, \(unescaped: vecLiteral)::vector, \(frame.createdAt), \(frame.updatedAt))",
+                "INSERT INTO glue_frames (id, content, metadata, embedding, created_at, updated_at) VALUES (\(frame.id), \(frame.content), \(metadataJSON)::jsonb, \(unescaped: "'\(vecLiteral)'::vector"), \(frame.createdAt), \(frame.updatedAt))",
                 logger: logger
             )
         } else {
@@ -98,7 +98,7 @@ public actor PostgresStorageBackend: StorageBackend {
         if let embedding = frame.embedding {
             let vecLiteral = vectorLiteral(embedding)
             try await client.query(
-                "UPDATE glue_frames SET content = \(frame.content), metadata = \(metadataJSON)::jsonb, embedding = \(unescaped: vecLiteral)::vector, updated_at = \(frame.updatedAt) WHERE id = \(frame.id)",
+                "UPDATE glue_frames SET content = \(frame.content), metadata = \(metadataJSON)::jsonb, embedding = \(unescaped: "'\(vecLiteral)'::vector"), updated_at = \(frame.updatedAt) WHERE id = \(frame.id)",
                 logger: logger
             )
         } else {
