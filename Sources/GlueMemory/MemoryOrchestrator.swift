@@ -166,6 +166,19 @@ public actor MemoryOrchestrator {
         try await backend.listFrames(metadata: metadata)
     }
 
+    /// Duplicate an existing frame with new metadata, preserving its embedding.
+    /// Use this when re-tagging cached content to avoid re-computing embeddings.
+    @discardableResult
+    public func duplicate(_ frame: MemoryFrame, metadata: [String: String]) async throws -> MemoryFrame {
+        let newFrame = MemoryFrame(
+            content: frame.content,
+            metadata: metadata,
+            embedding: frame.embedding
+        )
+        try await backend.storeFrame(newFrame)
+        return newFrame
+    }
+
     /// Delete a frame by ID.
     public func forget(id: UUID) async throws {
         try await backend.deleteFrame(id: id)

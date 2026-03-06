@@ -41,10 +41,32 @@ public actor PostgresStorageBackend: StorageBackend {
             self.runTask = Task {
                 await client.run()
             }
+            // Give the run loop Task a chance to be scheduled by the executor.
+            // Without this yield, the background Task may not have started yet
+            // and the first query would trigger a PostgresClient warning.
+            await Task.yield()
+            try await waitForConnection(maxAttempts: 10, delayMs: 100)
         }
 
         try await client.withConnection { conn in
             try await PostgresMigrations.migrate(connection: conn)
+        }
+    }
+
+    /// Retry a simple query until the connection pool is ready.
+    private func waitForConnection(maxAttempts: Int, delayMs: UInt64) async throws {
+        for attempt in 1...maxAttempts {
+            do {
+                _ = try await client.query("SELECT 1", logger: logger)
+                logger.debug("PostgresClient connection ready (attempt \(attempt))")
+                return
+            } catch {
+                if attempt == maxAttempts {
+                    logger.error("PostgresClient failed to connect after \(maxAttempts) attempts: \(error)")
+                    throw error
+                }
+                try await Task.sleep(nanoseconds: delayMs * 1_000_000)
+            }
         }
     }
 
@@ -131,7 +153,7 @@ public actor PostgresStorageBackend: StorageBackend {
         if let metadata, !metadata.isEmpty {
             // Build parameterized metadata conditions
             // Validate keys are alphanumeric+underscore only
-            var sql = "SELECT id, content, metadata::text, created_at, updated_at FROM glue_frames WHERE "
+            var sql = "SELECT id, content, metadata::text, embedding::text, created_at, updated_at FROM glue_frames WHERE "
             var conditions: [String] = []
             for (key, value) in metadata {
                 guard isValidMetadataKey(key) else {
@@ -143,17 +165,17 @@ public actor PostgresStorageBackend: StorageBackend {
             let rows = try await client.query(PostgresQuery(unsafeSQL: sql), logger: logger)
             var frames: [MemoryFrame] = []
             for try await row in rows {
-                frames.append(try decodeFrame(row))
+                frames.append(try decodeFrameWithEmbedding(row))
             }
             return frames
         } else {
             let rows = try await client.query(
-                "SELECT id, content, metadata::text, created_at, updated_at FROM glue_frames",
+                "SELECT id, content, metadata::text, embedding::text, created_at, updated_at FROM glue_frames",
                 logger: logger
             )
             var frames: [MemoryFrame] = []
             for try await row in rows {
-                frames.append(try decodeFrame(row))
+                frames.append(try decodeFrameWithEmbedding(row))
             }
             return frames
         }
@@ -370,6 +392,30 @@ public actor PostgresStorageBackend: StorageBackend {
             id: id,
             content: content,
             metadata: metadata,
+            createdAt: createdAt,
+            updatedAt: updatedAt
+        )
+    }
+
+    private func decodeFrameWithEmbedding(_ row: PostgresRow) throws -> MemoryFrame {
+        let (id, content, metadataJSON, embeddingText, createdAt, updatedAt) = try row.decode(
+            (UUID, String, String, String?, Date, Date).self, context: .default
+        )
+
+        let metadata = (try? JSONDecoder().decode([String: String].self, from: Data(metadataJSON.utf8))) ?? [:]
+
+        // Parse pgvector text format: "[0.1,0.2,0.3]"
+        let embedding: [Float]? = embeddingText.flatMap { text in
+            let trimmed = text.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+            let floats = trimmed.split(separator: ",").compactMap { Float($0.trimmingCharacters(in: .whitespaces)) }
+            return floats.isEmpty ? nil : floats
+        }
+
+        return MemoryFrame(
+            id: id,
+            content: content,
+            metadata: metadata,
+            embedding: embedding,
             createdAt: createdAt,
             updatedAt: updatedAt
         )
