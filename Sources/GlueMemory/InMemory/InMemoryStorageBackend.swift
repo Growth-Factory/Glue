@@ -67,7 +67,7 @@ public actor InMemoryStorageBackend: StorageBackend {
         var filtered: [TextSearchResult] = []
         for result in results {
             guard filtered.count < topK else { break }
-            if let frame = frames[result.frameId], matchesFilters(frame.metadata, filters: filters) {
+            if let frame = frames[result.frameId], matchesFilters(frame, filters: filters) {
                 filtered.append(result)
             }
         }
@@ -92,7 +92,7 @@ public actor InMemoryStorageBackend: StorageBackend {
         var filtered: [SearchResult] = []
         for (id, score) in results {
             guard filtered.count < topK else { break }
-            if let frame = frames[id], matchesFilters(frame.metadata, filters: filters) {
+            if let frame = frames[id], matchesFilters(frame, filters: filters) {
                 filtered.append(SearchResult(frameId: id, score: score, content: frame.content))
             }
         }
@@ -135,15 +135,17 @@ public actor InMemoryStorageBackend: StorageBackend {
 
     // MARK: - Private
 
-    private func matchesFilters(_ metadata: [String: String], filters: [MetadataFilter]) -> Bool {
+    private func matchesFilters(_ frame: MemoryFrame, filters: [MetadataFilter]) -> Bool {
         filters.allSatisfy { filter in
             switch filter {
             case .equals(let key, let value):
-                return metadata[key] == value
+                return frame.metadata[key] == value
             case .contains(let key, let value):
-                return metadata[key]?.contains(value) == true
+                return frame.metadata[key]?.contains(value) == true
             case .exists(let key):
-                return metadata[key] != nil
+                return frame.metadata[key] != nil
+            case .hasTag(let tag):
+                return frame.tags.contains(tag)
             }
         }
     }

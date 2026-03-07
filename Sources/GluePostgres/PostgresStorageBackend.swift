@@ -79,16 +79,17 @@ public actor PostgresStorageBackend: StorageBackend {
 
     public func storeFrame(_ frame: MemoryFrame) async throws {
         let metadataJSON = try String(data: JSONEncoder().encode(frame.metadata), encoding: .utf8) ?? "{}"
+        let tagsLiteral = pgArrayLiteral(frame.tags)
 
         if let embedding = frame.embedding {
             let vecLiteral = vectorLiteral(embedding)
             try await client.query(
-                "INSERT INTO glue_frames (id, content, metadata, embedding, created_at, updated_at) VALUES (\(frame.id), \(frame.content), \(metadataJSON)::jsonb, \(unescaped: "'\(vecLiteral)'::vector"), \(frame.createdAt), \(frame.updatedAt))",
+                "INSERT INTO glue_frames (id, content, metadata, tags, embedding, created_at, updated_at) VALUES (\(frame.id), \(frame.content), \(metadataJSON)::jsonb, \(unescaped: "'\(tagsLiteral)'::text[]"), \(unescaped: "'\(vecLiteral)'::vector"), \(frame.createdAt), \(frame.updatedAt))",
                 logger: logger
             )
         } else {
             try await client.query(
-                "INSERT INTO glue_frames (id, content, metadata, created_at, updated_at) VALUES (\(frame.id), \(frame.content), \(metadataJSON)::jsonb, \(frame.createdAt), \(frame.updatedAt))",
+                "INSERT INTO glue_frames (id, content, metadata, tags, created_at, updated_at) VALUES (\(frame.id), \(frame.content), \(metadataJSON)::jsonb, \(unescaped: "'\(tagsLiteral)'::text[]"), \(frame.createdAt), \(frame.updatedAt))",
                 logger: logger
             )
         }
@@ -105,7 +106,7 @@ public actor PostgresStorageBackend: StorageBackend {
 
     public func fetchFrame(id: UUID) async throws -> MemoryFrame? {
         let rows = try await client.query(
-            "SELECT id, content, metadata::text, created_at, updated_at FROM glue_frames WHERE id = \(id)",
+            "SELECT id, content, metadata::text, tags::text, created_at, updated_at FROM glue_frames WHERE id = \(id)",
             logger: logger
         )
         for try await row in rows {
@@ -116,16 +117,17 @@ public actor PostgresStorageBackend: StorageBackend {
 
     public func updateFrame(_ frame: MemoryFrame) async throws {
         let metadataJSON = try String(data: JSONEncoder().encode(frame.metadata), encoding: .utf8) ?? "{}"
+        let tagsLiteral = pgArrayLiteral(frame.tags)
 
         if let embedding = frame.embedding {
             let vecLiteral = vectorLiteral(embedding)
             try await client.query(
-                "UPDATE glue_frames SET content = \(frame.content), metadata = \(metadataJSON)::jsonb, embedding = \(unescaped: "'\(vecLiteral)'::vector"), updated_at = \(frame.updatedAt) WHERE id = \(frame.id)",
+                "UPDATE glue_frames SET content = \(frame.content), metadata = \(metadataJSON)::jsonb, tags = \(unescaped: "'\(tagsLiteral)'::text[]"), embedding = \(unescaped: "'\(vecLiteral)'::vector"), updated_at = \(frame.updatedAt) WHERE id = \(frame.id)",
                 logger: logger
             )
         } else {
             try await client.query(
-                "UPDATE glue_frames SET content = \(frame.content), metadata = \(metadataJSON)::jsonb, updated_at = \(frame.updatedAt) WHERE id = \(frame.id)",
+                "UPDATE glue_frames SET content = \(frame.content), metadata = \(metadataJSON)::jsonb, tags = \(unescaped: "'\(tagsLiteral)'::text[]"), updated_at = \(frame.updatedAt) WHERE id = \(frame.id)",
                 logger: logger
             )
         }
@@ -149,11 +151,27 @@ public actor PostgresStorageBackend: StorageBackend {
         }
     }
 
+    public func addTag(_ tag: String, to frameId: UUID) async throws {
+        let escaped = tag.replacingOccurrences(of: "'", with: "''")
+        try await client.query(
+            PostgresQuery(unsafeSQL: "UPDATE glue_frames SET tags = array_append(tags, '\(escaped)'), updated_at = NOW() WHERE id = '\(frameId)' AND NOT ('\(escaped)' = ANY(tags))"),
+            logger: logger
+        )
+    }
+
+    public func addTags(_ tag: String, to frameIds: [UUID]) async throws {
+        guard !frameIds.isEmpty else { return }
+        let escaped = tag.replacingOccurrences(of: "'", with: "''")
+        let idList = frameIds.map { "'\($0)'" }.joined(separator: ",")
+        try await client.query(
+            PostgresQuery(unsafeSQL: "UPDATE glue_frames SET tags = array_append(tags, '\(escaped)'), updated_at = NOW() WHERE id IN (\(idList)) AND NOT ('\(escaped)' = ANY(tags))"),
+            logger: logger
+        )
+    }
+
     public func listFrames(metadata: [String: String]?) async throws -> [MemoryFrame] {
         if let metadata, !metadata.isEmpty {
-            // Build parameterized metadata conditions
-            // Validate keys are alphanumeric+underscore only
-            var sql = "SELECT id, content, metadata::text, embedding::text, created_at, updated_at FROM glue_frames WHERE "
+            var sql = "SELECT id, content, metadata::text, tags::text, embedding::text, created_at, updated_at FROM glue_frames WHERE "
             var conditions: [String] = []
             for (key, value) in metadata {
                 guard isValidMetadataKey(key) else {
@@ -170,7 +188,7 @@ public actor PostgresStorageBackend: StorageBackend {
             return frames
         } else {
             let rows = try await client.query(
-                "SELECT id, content, metadata::text, embedding::text, created_at, updated_at FROM glue_frames",
+                "SELECT id, content, metadata::text, tags::text, embedding::text, created_at, updated_at FROM glue_frames",
                 logger: logger
             )
             var frames: [MemoryFrame] = []
@@ -344,6 +362,29 @@ public actor PostgresStorageBackend: StorageBackend {
         "[" + v.map { String($0) }.joined(separator: ",") + "]"
     }
 
+    /// Convert a Set<String> to a PostgreSQL text[] literal: {tag1,tag2}
+    private func pgArrayLiteral(_ tags: Set<String>) -> String {
+        let escaped = tags.sorted().map { $0.replacingOccurrences(of: "\"", with: "\\\"") }
+        return "{" + escaped.map { "\"\($0)\"" }.joined(separator: ",") + "}"
+    }
+
+    /// Parse PostgreSQL text[] format: {tag1,tag2,"tag with spaces"} → Set<String>
+    private func parsePgArray(_ text: String?) -> Set<String> {
+        guard let text, text != "{}" else { return [] }
+        // Strip outer braces
+        let inner = text.trimmingCharacters(in: CharacterSet(charactersIn: "{}"))
+        guard !inner.isEmpty else { return [] }
+        // Split on comma, strip quotes
+        let items = inner.split(separator: ",").map { element in
+            var s = String(element).trimmingCharacters(in: .whitespaces)
+            if s.hasPrefix("\"") && s.hasSuffix("\"") {
+                s = String(s.dropFirst().dropLast())
+            }
+            return s
+        }
+        return Set(items)
+    }
+
     private func isValidMetadataKey(_ key: String) -> Bool {
         let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_"))
         return key.unicodeScalars.allSatisfy { allowed.contains($0) }
@@ -360,6 +401,8 @@ public actor PostgresStorageBackend: StorageBackend {
         case .exists(let key):
             guard isValidMetadataKey(key) else { return "TRUE" }
             return "metadata ? '\(key)'"
+        case .hasTag(let tag):
+            return "'\(tag.replacingOccurrences(of: "'", with: "''"))' = ANY(tags)"
         }
     }
 
@@ -382,8 +425,8 @@ public actor PostgresStorageBackend: StorageBackend {
     }
 
     private func decodeFrame(_ row: PostgresRow) throws -> MemoryFrame {
-        let (id, content, metadataJSON, createdAt, updatedAt) = try row.decode(
-            (UUID, String, String, Date, Date).self, context: .default
+        let (id, content, metadataJSON, tagsText, createdAt, updatedAt) = try row.decode(
+            (UUID, String, String, String?, Date, Date).self, context: .default
         )
 
         let metadata = (try? JSONDecoder().decode([String: String].self, from: Data(metadataJSON.utf8))) ?? [:]
@@ -392,14 +435,15 @@ public actor PostgresStorageBackend: StorageBackend {
             id: id,
             content: content,
             metadata: metadata,
+            tags: parsePgArray(tagsText),
             createdAt: createdAt,
             updatedAt: updatedAt
         )
     }
 
     private func decodeFrameWithEmbedding(_ row: PostgresRow) throws -> MemoryFrame {
-        let (id, content, metadataJSON, embeddingText, createdAt, updatedAt) = try row.decode(
-            (UUID, String, String, String?, Date, Date).self, context: .default
+        let (id, content, metadataJSON, tagsText, embeddingText, createdAt, updatedAt) = try row.decode(
+            (UUID, String, String, String?, String?, Date, Date).self, context: .default
         )
 
         let metadata = (try? JSONDecoder().decode([String: String].self, from: Data(metadataJSON.utf8))) ?? [:]
@@ -415,6 +459,7 @@ public actor PostgresStorageBackend: StorageBackend {
             id: id,
             content: content,
             metadata: metadata,
+            tags: parsePgArray(tagsText),
             embedding: embedding,
             createdAt: createdAt,
             updatedAt: updatedAt

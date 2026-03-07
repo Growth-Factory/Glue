@@ -60,6 +60,21 @@ public enum PostgresMigrations: Sendable {
             logger: .init(label: "glue.migrations")
         )
 
+        // Tags array column (multi-tag support)
+        try await connection.query("""
+            ALTER TABLE glue_frames ADD COLUMN IF NOT EXISTS tags text[] NOT NULL DEFAULT '{}'
+            """,
+            logger: .init(label: "glue.migrations")
+        )
+
+        // GIN index for fast tag lookups
+        try await connection.query("""
+            CREATE INDEX IF NOT EXISTS idx_glue_frames_tags
+            ON glue_frames USING gin(tags)
+            """,
+            logger: .init(label: "glue.migrations")
+        )
+
         // Structured facts table
         try await connection.query("""
             CREATE TABLE IF NOT EXISTS glue_facts (

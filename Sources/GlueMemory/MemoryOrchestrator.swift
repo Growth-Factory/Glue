@@ -43,7 +43,7 @@ public actor MemoryOrchestrator {
 
     // MARK: - Remember / Recall
 
-    /// Store a piece of content in memory with optional metadata.
+    /// Store a piece of content in memory with optional metadata and tags.
     /// Returns the created `MemoryFrame`.
     ///
     /// Long content is automatically chunked using the configured `chunkingStrategy`.
@@ -55,7 +55,8 @@ public actor MemoryOrchestrator {
     @discardableResult
     public func remember(
         _ content: String,
-        metadata: [String: String] = [:]
+        metadata: [String: String] = [:],
+        tags: Set<String> = []
     ) async throws -> MemoryFrame {
         let start = clock.now
 
@@ -101,17 +102,17 @@ public actor MemoryOrchestrator {
         if chunks.count <= 1 {
             // Short content — store as a single frame
             let storedContent = surrogate != nil ? content + "\n\n" + surrogate! : content
-            result = try await storeOneFrame(content: storedContent, metadata: meta)
+            result = try await storeOneFrame(content: storedContent, metadata: meta, tags: tags)
         } else {
             // Long content — store full content as parent frame, then each chunk
-            let parentFrame = try await storeOneFrame(content: content, metadata: meta)
+            let parentFrame = try await storeOneFrame(content: content, metadata: meta, tags: tags)
 
             for (i, chunk) in chunks.enumerated() {
                 var chunkMeta = meta
                 chunkMeta["_parentId"] = parentFrame.id.uuidString
                 chunkMeta["_chunkIndex"] = String(i)
                 let chunkContent = surrogate != nil ? chunk + "\n\n" + surrogate! : chunk
-                try await storeOneFrame(content: chunkContent, metadata: chunkMeta)
+                try await storeOneFrame(content: chunkContent, metadata: chunkMeta, tags: tags)
             }
 
             logger.debug("Stored frame \(parentFrame.id) with \(chunks.count) chunks")
@@ -138,7 +139,8 @@ public actor MemoryOrchestrator {
     @discardableResult
     private func storeOneFrame(
         content: String,
-        metadata: [String: String]
+        metadata: [String: String],
+        tags: Set<String> = []
     ) async throws -> MemoryFrame {
         var embedding: [Float]?
         if config.enableVectorSearch, let provider = embeddingProvider {
@@ -150,6 +152,7 @@ public actor MemoryOrchestrator {
         let frame = MemoryFrame(
             content: content,
             metadata: metadata,
+            tags: tags,
             embedding: embedding
         )
         try await backend.storeFrame(frame)
@@ -177,6 +180,16 @@ public actor MemoryOrchestrator {
         )
         try await backend.storeFrame(newFrame)
         return newFrame
+    }
+
+    /// Add a tag to an existing frame. No-op if the frame already has the tag.
+    public func addTag(_ tag: String, to frameId: UUID) async throws {
+        try await backend.addTag(tag, to: frameId)
+    }
+
+    /// Add a tag to multiple frames at once.
+    public func addTag(_ tag: String, to frameIds: [UUID]) async throws {
+        try await backend.addTags(tag, to: frameIds)
     }
 
     /// Delete a frame by ID.

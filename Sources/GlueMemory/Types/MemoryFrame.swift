@@ -5,6 +5,7 @@ public struct MemoryFrame: Sendable, Codable, Identifiable, Equatable {
     public let id: UUID
     public var content: String
     public var metadata: [String: String]
+    public var tags: Set<String>
     public var embedding: [Float]?
     public let createdAt: Date
     public var updatedAt: Date
@@ -13,6 +14,7 @@ public struct MemoryFrame: Sendable, Codable, Identifiable, Equatable {
         id: UUID = UUID(),
         content: String,
         metadata: [String: String] = [:],
+        tags: Set<String> = [],
         embedding: [Float]? = nil,
         createdAt: Date = Date(),
         updatedAt: Date = Date()
@@ -20,6 +22,7 @@ public struct MemoryFrame: Sendable, Codable, Identifiable, Equatable {
         self.id = id
         self.content = content
         self.metadata = metadata
+        self.tags = tags
         self.embedding = embedding
         self.createdAt = createdAt
         self.updatedAt = updatedAt

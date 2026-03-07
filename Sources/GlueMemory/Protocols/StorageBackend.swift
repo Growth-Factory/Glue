@@ -24,6 +24,12 @@ public protocol StorageBackend: Sendable {
     /// Delete multiple frames by ID.
     func deleteFrames(ids: [UUID]) async throws
 
+    /// Add a tag to a frame without touching other fields.
+    func addTag(_ tag: String, to frameId: UUID) async throws
+
+    /// Add a tag to multiple frames.
+    func addTags(_ tag: String, to frameIds: [UUID]) async throws
+
     /// List all frames, optionally filtered by metadata.
     func listFrames(metadata: [String: String]?) async throws -> [MemoryFrame]
 
@@ -89,6 +95,22 @@ extension StorageBackend {
         }
     }
 
+    /// Default addTag: fetch, mutate, update (safe for in-memory, overridden for Postgres).
+    public func addTag(_ tag: String, to frameId: UUID) async throws {
+        guard var frame = try await fetchFrame(id: frameId) else { return }
+        guard !frame.tags.contains(tag) else { return }
+        frame.tags.insert(tag)
+        frame.updatedAt = Date()
+        try await updateFrame(frame)
+    }
+
+    /// Default addTags: loop over individual addTag calls.
+    public func addTags(_ tag: String, to frameIds: [UUID]) async throws {
+        for id in frameIds {
+            try await addTag(tag, to: id)
+        }
+    }
+
     /// Default filtered text search: delegates to unfiltered then filters in memory.
     public func textSearch(query: String, topK: Int, filters: [MetadataFilter]) async throws -> [TextSearchResult] {
         let results = try await textSearch(query: query, topK: topK * 3)
@@ -98,7 +120,7 @@ extension StorageBackend {
         for result in results {
             guard filtered.count < topK else { break }
             if let frame = try await fetchFrame(id: result.frameId),
-               matchesFilters(frame.metadata, filters: filters) {
+               matchesFilters(frame, filters: filters) {
                 filtered.append(result)
             }
         }
@@ -113,7 +135,7 @@ extension StorageBackend {
         for result in results {
             guard filtered.count < topK else { break }
             if let frame = try await fetchFrame(id: result.frameId),
-               matchesFilters(frame.metadata, filters: filters) {
+               matchesFilters(frame, filters: filters) {
                 filtered.append(result)
             }
         }
@@ -121,15 +143,17 @@ extension StorageBackend {
     }
 }
 
-private func matchesFilters(_ metadata: [String: String], filters: [MetadataFilter]) -> Bool {
+private func matchesFilters(_ frame: MemoryFrame, filters: [MetadataFilter]) -> Bool {
     filters.allSatisfy { filter in
         switch filter {
         case .equals(let key, let value):
-            return metadata[key] == value
+            return frame.metadata[key] == value
         case .contains(let key, let value):
-            return metadata[key]?.contains(value) == true
+            return frame.metadata[key]?.contains(value) == true
         case .exists(let key):
-            return metadata[key] != nil
+            return frame.metadata[key] != nil
+        case .hasTag(let tag):
+            return frame.tags.contains(tag)
         }
     }
 }

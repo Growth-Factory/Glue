@@ -8,4 +8,7 @@ public enum MetadataFilter: Sendable, Equatable {
 
     /// Key existence: metadata has key
     case exists(key: String)
+
+    /// Tag membership: frame.tags contains the given tag
+    case hasTag(String)
 }
