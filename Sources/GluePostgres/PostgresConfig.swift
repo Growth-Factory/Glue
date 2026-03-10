@@ -10,7 +10,7 @@ public struct PostgresConfig: Sendable {
     public let username: String
     public let password: String?
     public let database: String
-    public let tls: PostgresConnection.Configuration.TLS
+    public let tls: PostgresClient.Configuration.TLS
     public let vectorIndexType: VectorIndexType
     public let minConnections: Int
     public let maxConnections: Int
@@ -21,7 +21,7 @@ public struct PostgresConfig: Sendable {
         username: String = "postgres",
         password: String? = nil,
         database: String = "glue",
-        tls: PostgresConnection.Configuration.TLS = .disable,
+        tls: PostgresClient.Configuration.TLS = .disable,
         vectorIndexType: VectorIndexType = .default,
         minConnections: Int = 0,
         maxConnections: Int = 20
@@ -45,12 +45,12 @@ public struct PostgresConfig: Sendable {
             throw PostgresConfigError.invalidURL(url)
         }
         let sslMode = components.queryItems?.first(where: { $0.name == "sslmode" })?.value
-        let tls: PostgresConnection.Configuration.TLS
+        let tls: PostgresClient.Configuration.TLS
         switch sslMode {
         case "require", "verify-ca", "verify-full", "prefer":
             var tlsConfig = TLSConfiguration.makeClientConfiguration()
             tlsConfig.certificateVerification = .none
-            tls = try .require(.init(configuration: tlsConfig))
+            tls = .require(tlsConfig)
         default:
             tls = .disable
         }
@@ -60,17 +60,6 @@ public struct PostgresConfig: Sendable {
             username: components.user ?? "postgres",
             password: components.password,
             database: String(components.path.dropFirst()),
-            tls: tls
-        )
-    }
-
-    var connectionConfig: PostgresConnection.Configuration {
-        PostgresConnection.Configuration(
-            host: host,
-            port: port,
-            username: username,
-            password: password,
-            database: database,
             tls: tls
         )
     }
