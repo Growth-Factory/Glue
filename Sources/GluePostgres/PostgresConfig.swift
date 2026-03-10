@@ -1,4 +1,5 @@
 import Foundation
+import NIOSSL
 import PostgresNIO
 import GlueMemory
 
@@ -37,9 +38,21 @@ public struct PostgresConfig: Sendable {
     }
 
     /// Parse from a PostgreSQL connection URL.
+    ///
+    /// Supports `sslmode=require` and `sslmode=disable` query parameters.
     public static func from(url: String) throws -> PostgresConfig {
         guard let components = URLComponents(string: url) else {
             throw PostgresConfigError.invalidURL(url)
+        }
+        let sslMode = components.queryItems?.first(where: { $0.name == "sslmode" })?.value
+        let tls: PostgresConnection.Configuration.TLS
+        switch sslMode {
+        case "require", "verify-ca", "verify-full", "prefer":
+            var tlsConfig = TLSConfiguration.makeClientConfiguration()
+            tlsConfig.certificateVerification = .none
+            tls = try .require(.init(configuration: tlsConfig))
+        default:
+            tls = .disable
         }
         return PostgresConfig(
             host: components.host ?? "localhost",
@@ -47,7 +60,7 @@ public struct PostgresConfig: Sendable {
             username: components.user ?? "postgres",
             password: components.password,
             database: String(components.path.dropFirst()),
-            tls: .disable
+            tls: tls
         )
     }
 
@@ -70,7 +83,7 @@ public struct PostgresConfig: Sendable {
             username: username,
             password: password,
             database: database,
-            tls: .disable
+            tls: tls
         )
         config.options.minimumConnections = minConnections
         config.options.maximumConnections = maxConnections
