@@ -154,34 +154,74 @@ public enum TextChunker: Sendable {
 
     // MARK: - Helpers
 
+    /// Common abbreviations that should NOT trigger a sentence split.
+    private static let abbreviations: Set<String> = [
+        "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st",
+        "inc", "ltd", "co", "corp", "dept", "univ",
+        "vs", "etc", "approx", "est", "vol", "no",
+        "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+        "fig", "eq", "ref", "sec", "ch", "pg",
+    ]
+
     static func splitSentences(_ text: String) -> [String] {
         var sentences: [String] = []
-        let pattern = "(?<=[.!?])\\s+"
-        guard let regex = try? NSRegularExpression(pattern: pattern) else {
-            return [text]
-        }
-        let nsText = text as NSString
-        var lastEnd = 0
-        let matches = regex.matches(in: text, range: NSRange(location: 0, length: nsText.length))
+        var current = ""
 
-        for match in matches {
-            let sentence = nsText.substring(with: NSRange(location: lastEnd, length: match.range.location - lastEnd))
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            if !sentence.isEmpty {
-                sentences.append(sentence)
+        let chars = Array(text)
+        var i = 0
+        while i < chars.count {
+            let ch = chars[i]
+            current.append(ch)
+
+            if ch == "." || ch == "!" || ch == "?" {
+                // Look ahead: is there whitespace followed by an uppercase letter or end?
+                let nextIdx = i + 1
+                guard nextIdx < chars.count, chars[nextIdx].isWhitespace else {
+                    i += 1
+                    continue
+                }
+
+                // Check for abbreviation before the period
+                if ch == "." {
+                    // Extract word before the dot
+                    let trimmed = current.dropLast() // remove the dot
+                    if let lastSpace = trimmed.lastIndex(where: { $0.isWhitespace || $0 == "(" }) {
+                        let word = String(trimmed[trimmed.index(after: lastSpace)...]).lowercased()
+                        if abbreviations.contains(word) { i += 1; continue }
+                    } else {
+                        let word = String(trimmed).lowercased()
+                        if abbreviations.contains(word) { i += 1; continue }
+                    }
+
+                    // Skip decimal numbers: digit before dot, digit after whitespace-skip
+                    if let prev = trimmed.last, prev.isNumber {
+                        // Look past whitespace for digit
+                        var peek = nextIdx
+                        while peek < chars.count && chars[peek].isWhitespace { peek += 1 }
+                        if peek < chars.count && chars[peek].isNumber { i += 1; continue }
+                    }
+
+                    // Single uppercase letter (initials like "U.S.")
+                    if trimmed.count >= 1 {
+                        let beforeDot = trimmed.last!
+                        if beforeDot.isUppercase && (trimmed.count == 1 || trimmed[trimmed.index(trimmed.endIndex, offsetBy: -2)].isWhitespace || trimmed[trimmed.index(trimmed.endIndex, offsetBy: -2)] == ".") {
+                            i += 1; continue
+                        }
+                    }
+                }
+
+                // This looks like a real sentence boundary
+                let sentence = current.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !sentence.isEmpty { sentences.append(sentence) }
+                current = ""
             }
-            lastEnd = match.range.location + match.range.length
+            i += 1
         }
 
-        // Remaining text
-        if lastEnd < nsText.length {
-            let remaining = nsText.substring(from: lastEnd).trimmingCharacters(in: .whitespacesAndNewlines)
-            if !remaining.isEmpty {
-                sentences.append(remaining)
-            }
-        }
+        let remaining = current.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !remaining.isEmpty { sentences.append(remaining) }
 
-        return sentences
+        return sentences.isEmpty ? [text] : sentences
     }
 }
 

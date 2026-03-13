@@ -98,21 +98,51 @@ public actor MemoryOrchestrator {
         // Chunk long content
         let chunks = TextChunker.chunk(content, strategy: config.chunkingStrategy, tokenCounter: config.tokenCounter)
 
+        // Build embedding-enriched text (content + surrogate) for vector search,
+        // but store only the original content to avoid polluting search results.
+        let surrogateSuffix = surrogate.map { "\n\n" + $0 } ?? ""
+
         let result: MemoryFrame
         if chunks.count <= 1 {
             // Short content — store as a single frame
-            let storedContent = surrogate != nil ? content + "\n\n" + surrogate! : content
-            result = try await storeOneFrame(content: storedContent, metadata: meta, tags: tags)
+            result = try await storeOneFrame(
+                content: content,
+                embeddingContent: content + surrogateSuffix,
+                metadata: meta,
+                tags: tags
+            )
         } else {
-            // Long content — store full content as parent frame, then each chunk
-            let parentFrame = try await storeOneFrame(content: content, metadata: meta, tags: tags)
+            // Long content — store full content as parent frame, then each chunk.
+            // Batch-embed all texts (parent + chunks) in a single API call.
+            let allEmbeddingTexts = [content + surrogateSuffix] + chunks.map { $0 + surrogateSuffix }
+
+            var allEmbeddings: [[Float]?]
+            if config.enableVectorSearch, let provider = embeddingProvider {
+                let embStart = clock.now
+                let vectors = try await provider.embedBatch(allEmbeddingTexts)
+                allEmbeddings = vectors.map { Optional($0) }
+                if let m = metrics { await m.recordEmbeddingLatency(clock.now - embStart) }
+            } else {
+                allEmbeddings = Array(repeating: nil, count: allEmbeddingTexts.count)
+            }
+
+            let parentFrame = try await storeOneFrame(
+                content: content,
+                metadata: meta,
+                tags: tags,
+                precomputedEmbedding: allEmbeddings[0]
+            )
 
             for (i, chunk) in chunks.enumerated() {
                 var chunkMeta = meta
                 chunkMeta["_parentId"] = parentFrame.id.uuidString
                 chunkMeta["_chunkIndex"] = String(i)
-                let chunkContent = surrogate != nil ? chunk + "\n\n" + surrogate! : chunk
-                try await storeOneFrame(content: chunkContent, metadata: chunkMeta, tags: tags)
+                try await storeOneFrame(
+                    content: chunk,
+                    metadata: chunkMeta,
+                    tags: tags,
+                    precomputedEmbedding: allEmbeddings[i + 1]
+                )
             }
 
             logger.debug("Stored frame \(parentFrame.id) with \(chunks.count) chunks")
@@ -136,16 +166,24 @@ public actor MemoryOrchestrator {
     }
 
     /// Store a single frame with optional embedding.
+    /// - Parameters:
+    ///   - content: The text stored in the frame (returned by search).
+    ///   - embeddingContent: The text used to compute the embedding vector.
+    ///     Pass enriched text (e.g. content + surrogate) to improve recall
+    ///     without polluting the stored content.
+    ///   - precomputedEmbedding: If provided, skip embedding computation and use this vector.
     @discardableResult
     private func storeOneFrame(
         content: String,
+        embeddingContent: String? = nil,
         metadata: [String: String],
-        tags: Set<String> = []
+        tags: Set<String> = [],
+        precomputedEmbedding: [Float]? = nil
     ) async throws -> MemoryFrame {
-        var embedding: [Float]?
-        if config.enableVectorSearch, let provider = embeddingProvider {
+        var embedding: [Float]? = precomputedEmbedding
+        if embedding == nil, config.enableVectorSearch, let provider = embeddingProvider {
             let embStart = clock.now
-            embedding = try await provider.embed(content)
+            embedding = try await provider.embed(embeddingContent ?? content)
             if let m = metrics { await m.recordEmbeddingLatency(clock.now - embStart) }
         }
 
