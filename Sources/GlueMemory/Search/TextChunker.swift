@@ -164,6 +164,7 @@ public enum TextChunker: Sendable {
     ]
 
     static func splitSentences(_ text: String) -> [String] {
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
         var sentences: [String] = []
         var current = ""
 

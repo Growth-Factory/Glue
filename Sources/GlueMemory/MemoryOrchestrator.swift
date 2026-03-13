@@ -432,12 +432,14 @@ public actor MemoryOrchestrator {
 
     // MARK: - Private Helpers
 
-    /// Simple SHA-256-style content hash using Swift's built-in Hasher.
-    /// Produces a stable hex string for deduplication purposes.
+    /// Stable FNV-1a content hash for deduplication across process restarts.
+    /// Uses FNV-1a (64-bit) which is deterministic, unlike Swift's Hasher.
     private func contentHash(_ content: String) -> String {
-        var hasher = Hasher()
-        hasher.combine(content)
-        let hash = hasher.finalize()
-        return String(format: "%016x", hash)
+        var hash: UInt64 = 0xcbf29ce484222325 // FNV offset basis
+        for byte in content.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 0x100000001b3 // FNV prime
+        }
+        return String(format: "%016llx", hash)
     }
 }
