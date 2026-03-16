@@ -153,13 +153,69 @@ public actor MemoryOrchestrator {
         return result
     }
 
+    /// Store content with a pre-computed embedding vector.
+    /// Use this when you've already batch-embedded outside the actor to avoid
+    /// serialized per-item embedding calls.
+    @discardableResult
+    public func remember(
+        _ content: String,
+        precomputedEmbedding: [Float],
+        metadata: [String: String] = [:],
+        tags: Set<String> = []
+    ) async throws -> MemoryFrame {
+        let start = clock.now
+        let result = try await storeOneFrame(
+            content: content,
+            metadata: metadata,
+            tags: tags,
+            precomputedEmbedding: precomputedEmbedding
+        )
+        if let m = metrics { await m.recordIngestLatency(clock.now - start) }
+        return result
+    }
+
+    /// Batch-embed texts using the configured embedding provider.
+    /// Call this outside the actor to compute embeddings concurrently,
+    /// then pass results to `remember(_:precomputedEmbedding:metadata:tags:)`.
+    /// Returns empty arrays if no embedding provider is configured.
+    public func embedBatch(_ texts: [String]) async throws -> [[Float]] {
+        guard let provider = embeddingProvider else { return [] }
+        let start = clock.now
+        let result = try await provider.embedBatch(texts)
+        if let m = metrics { await m.recordEmbeddingLatency(clock.now - start) }
+        return result
+    }
+
     /// Store multiple items at once.
+    /// Batch-embeds all content in a single API call, then stores each frame
+    /// with its pre-computed embedding — much faster than sequential `remember()` calls.
     public func rememberBatch(
-        _ items: [(content: String, metadata: [String: String])]
+        _ items: [(content: String, metadata: [String: String])],
+        tags: Set<String> = []
     ) async throws -> [MemoryFrame] {
+        guard !items.isEmpty else { return [] }
+
+        // Batch-embed all content in one API call (single network round-trip)
+        let texts = items.map(\.content)
+        var embeddings: [[Float]?]
+        if config.enableVectorSearch, let provider = embeddingProvider {
+            let embStart = clock.now
+            let vectors = try await provider.embedBatch(texts)
+            embeddings = vectors.map { Optional($0) }
+            if let m = metrics { await m.recordEmbeddingLatency(clock.now - embStart) }
+        } else {
+            embeddings = Array(repeating: nil, count: items.count)
+        }
+
+        // Store each frame with its pre-computed embedding (no per-item network calls)
         var frames: [MemoryFrame] = []
-        for item in items {
-            let frame = try await remember(item.content, metadata: item.metadata)
+        for (i, item) in items.enumerated() {
+            let frame = try await storeOneFrame(
+                content: item.content,
+                metadata: item.metadata,
+                tags: tags,
+                precomputedEmbedding: embeddings[i]
+            )
             frames.append(frame)
         }
         return frames
