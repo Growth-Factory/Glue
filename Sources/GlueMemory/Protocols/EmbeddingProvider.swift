@@ -18,11 +18,19 @@ public protocol EmbeddingProvider: Sendable {
 }
 
 extension EmbeddingProvider {
+    /// Default: calls `embed()` concurrently for all texts.
+    /// Providers should override with a native batch API for best performance.
     public func embedBatch(_ texts: [String]) async throws -> [[Float]] {
-        var results: [[Float]] = []
-        for text in texts {
-            results.append(try await embed(text))
+        guard !texts.isEmpty else { return [] }
+        if texts.count == 1 { return [try await embed(texts[0])] }
+
+        return try await withThrowingTaskGroup(of: (Int, [Float]).self) { group in
+            for (i, text) in texts.enumerated() {
+                group.addTask { (i, try await self.embed(text)) }
+            }
+            var results = Array<[Float]?>(repeating: nil, count: texts.count)
+            for try await (i, vec) in group { results[i] = vec }
+            return results.map { $0! }
         }
-        return results
     }
 }
