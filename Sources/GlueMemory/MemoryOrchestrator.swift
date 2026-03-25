@@ -388,22 +388,30 @@ public actor MemoryOrchestrator {
             }
 
         case .hybrid(let alpha):
-            var textResults: [TextSearchResult] = []
-            var vectorResults: [SearchResult] = []
-
-            if config.enableTextSearch {
+            // Run text search and query embedding in parallel — they don't depend on each other
+            async let textTask: [TextSearchResult] = {
+                guard config.enableTextSearch else { return [] }
                 if filters.isEmpty {
-                    textResults = try await backend.textSearch(query: query, topK: topK)
+                    return try await backend.textSearch(query: query, topK: topK)
                 } else {
-                    textResults = try await backend.textSearch(query: query, topK: topK, filters: filters)
+                    return try await backend.textSearch(query: query, topK: topK, filters: filters)
                 }
-            }
-            if config.enableVectorSearch, let provider = embeddingProvider {
-                let queryEmbedding = try await provider.embed(query)
+            }()
+
+            async let embeddingTask: [Float]? = {
+                guard config.enableVectorSearch, let provider = embeddingProvider else { return nil }
+                return try await provider.embed(query)
+            }()
+
+            let textResults = try await textTask
+            let queryEmbedding = try await embeddingTask
+
+            var vectorResults: [SearchResult] = []
+            if let embedding = queryEmbedding {
                 if filters.isEmpty {
-                    vectorResults = try await backend.vectorSearch(embedding: queryEmbedding, topK: topK)
+                    vectorResults = try await backend.vectorSearch(embedding: embedding, topK: topK)
                 } else {
-                    vectorResults = try await backend.vectorSearch(embedding: queryEmbedding, topK: topK, filters: filters)
+                    vectorResults = try await backend.vectorSearch(embedding: embedding, topK: topK, filters: filters)
                 }
             }
 
