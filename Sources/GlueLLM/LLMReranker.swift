@@ -40,7 +40,7 @@ public struct LLMReranker: Reranker, Sendable {
 
         // Combine original results with new scores
         var scored = results.enumerated().map { (i, result) in
-            SearchResult(frameId: result.frameId, score: scores[i], content: result.content)
+            SearchResult(frameId: result.frameId, score: scores[i], content: result.content, metadata: result.metadata)
         }
         scored.sort { $0.score > $1.score }
         return Array(scored.prefix(topK))

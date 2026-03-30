@@ -18,7 +18,7 @@ public enum HybridSearch: Sendable {
         topK: Int,
         k: Float = 60
     ) -> [SearchResult] {
-        var scores: [UUID: (score: Float, content: String)] = [:]
+        var scores: [UUID: (score: Float, content: String, metadata: [String: String])] = [:]
 
         let textWeight = 1.0 - alpha
         let vectorWeight = alpha
@@ -29,7 +29,8 @@ public enum HybridSearch: Sendable {
             let existing = scores[result.frameId]
             scores[result.frameId] = (
                 score: (existing?.score ?? 0) + rrfScore,
-                content: existing?.content ?? result.snippet
+                content: existing?.content ?? result.snippet,
+                metadata: existing?.metadata ?? result.metadata
             )
         }
 
@@ -39,12 +40,13 @@ public enum HybridSearch: Sendable {
             let existing = scores[result.frameId]
             scores[result.frameId] = (
                 score: (existing?.score ?? 0) + rrfScore,
-                content: existing?.content ?? result.content
+                content: existing?.content ?? result.content,
+                metadata: existing?.metadata ?? result.metadata
             )
         }
 
         var results = scores.map { (id, value) in
-            SearchResult(frameId: id, score: value.score, content: value.content)
+            SearchResult(frameId: id, score: value.score, content: value.content, metadata: value.metadata)
         }
         results.sort { $0.score > $1.score }
         return Array(results.prefix(topK))

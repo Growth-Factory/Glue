@@ -80,7 +80,7 @@ public actor InMemoryStorageBackend: StorageBackend {
         let results = await vectorIndex.search(query: embedding, topK: topK)
         return results.compactMap { (id, score) in
             guard let frame = frames[id] else { return nil }
-            return SearchResult(frameId: id, score: score, content: frame.content)
+            return SearchResult(frameId: id, score: score, content: frame.content, metadata: frame.metadata)
         }
     }
 

@@ -371,7 +371,7 @@ public actor MemoryOrchestrator {
             } else {
                 textResults = try await backend.textSearch(query: query, topK: topK, filters: filters)
             }
-            return textResults.map { SearchResult(frameId: $0.frameId, score: $0.score, content: $0.snippet) }
+            return textResults.map { SearchResult(frameId: $0.frameId, score: $0.score, content: $0.snippet, metadata: $0.metadata) }
 
         case .vectorOnly:
             guard config.enableVectorSearch else {

@@ -5,11 +5,13 @@ public struct SearchResult: Sendable, Equatable {
     public let frameId: UUID
     public let score: Float
     public let content: String
+    public let metadata: [String: String]
 
-    public init(frameId: UUID, score: Float, content: String) {
+    public init(frameId: UUID, score: Float, content: String, metadata: [String: String] = [:]) {
         self.frameId = frameId
         self.score = score
         self.content = content
+        self.metadata = metadata
     }
 }
 

@@ -203,14 +203,15 @@ public actor PostgresStorageBackend: StorageBackend {
 
     public func textSearch(query: String, topK: Int) async throws -> [TextSearchResult] {
         let rows = try await client.query(
-            "SELECT id, content, ts_rank(to_tsvector('english', content), plainto_tsquery('english', \(query))) AS rank FROM glue_frames WHERE to_tsvector('english', content) @@ plainto_tsquery('english', \(query)) ORDER BY rank DESC LIMIT \(topK)",
+            "SELECT id, content, metadata::text, ts_rank(to_tsvector('english', content), plainto_tsquery('english', \(query))) AS rank FROM glue_frames WHERE to_tsvector('english', content) @@ plainto_tsquery('english', \(query)) ORDER BY rank DESC LIMIT \(topK)",
             logger: logger
         )
 
         var results: [TextSearchResult] = []
         for try await row in rows {
-            let (id, content, rank) = try row.decode((UUID, String, Float).self, context: .default)
-            results.append(TextSearchResult(frameId: id, score: rank, snippet: content))
+            let (id, content, metaJSON, rank) = try row.decode((UUID, String, String, Float).self, context: .default)
+            let meta = Self.parseMetadata(metaJSON)
+            results.append(TextSearchResult(frameId: id, score: rank, snippet: content, metadata: meta))
         }
         return results
     }
@@ -219,7 +220,7 @@ public actor PostgresStorageBackend: StorageBackend {
         guard !filters.isEmpty else {
             return try await textSearch(query: query, topK: topK)
         }
-        var sql = "SELECT id, content, ts_rank(to_tsvector('english', content), plainto_tsquery('english', '\(query.replacingOccurrences(of: "'", with: "''"))')) AS rank FROM glue_frames WHERE to_tsvector('english', content) @@ plainto_tsquery('english', '\(query.replacingOccurrences(of: "'", with: "''"))')"
+        var sql = "SELECT id, content, metadata::text, ts_rank(to_tsvector('english', content), plainto_tsquery('english', '\(query.replacingOccurrences(of: "'", with: "''"))')) AS rank FROM glue_frames WHERE to_tsvector('english', content) @@ plainto_tsquery('english', '\(query.replacingOccurrences(of: "'", with: "''"))')"
 
         for filter in filters {
             sql += " AND " + filterToSQL(filter)
@@ -229,8 +230,9 @@ public actor PostgresStorageBackend: StorageBackend {
         let rows = try await client.query(PostgresQuery(unsafeSQL: sql), logger: logger)
         var results: [TextSearchResult] = []
         for try await row in rows {
-            let (id, content, rank) = try row.decode((UUID, String, Float).self, context: .default)
-            results.append(TextSearchResult(frameId: id, score: rank, snippet: content))
+            let (id, content, metaJSON, rank) = try row.decode((UUID, String, String, Float).self, context: .default)
+            let meta = Self.parseMetadata(metaJSON)
+            results.append(TextSearchResult(frameId: id, score: rank, snippet: content, metadata: meta))
         }
         return results
     }
@@ -241,7 +243,7 @@ public actor PostgresStorageBackend: StorageBackend {
         let vecStr = vectorLiteral(embedding)
         let rows = try await client.query(
             PostgresQuery(unsafeSQL: """
-                SELECT id, content,
+                SELECT id, content, metadata::text,
                        1 - (embedding <=> '\(vecStr)'::vector) AS similarity
                 FROM glue_frames
                 WHERE embedding IS NOT NULL
@@ -253,8 +255,9 @@ public actor PostgresStorageBackend: StorageBackend {
 
         var results: [SearchResult] = []
         for try await row in rows {
-            let (id, content, similarity) = try row.decode((UUID, String, Float).self, context: .default)
-            results.append(SearchResult(frameId: id, score: similarity, content: content))
+            let (id, content, metaJSON, similarity) = try row.decode((UUID, String, String, Float).self, context: .default)
+            let meta = Self.parseMetadata(metaJSON)
+            results.append(SearchResult(frameId: id, score: similarity, content: content, metadata: meta))
         }
         return results
     }
@@ -265,7 +268,7 @@ public actor PostgresStorageBackend: StorageBackend {
         }
         let vecStr = vectorLiteral(embedding)
         var sql = """
-            SELECT id, content,
+            SELECT id, content, metadata::text,
                    1 - (embedding <=> '\(vecStr)'::vector) AS similarity
             FROM glue_frames
             WHERE embedding IS NOT NULL
@@ -278,8 +281,9 @@ public actor PostgresStorageBackend: StorageBackend {
         let rows = try await client.query(PostgresQuery(unsafeSQL: sql), logger: logger)
         var results: [SearchResult] = []
         for try await row in rows {
-            let (id, content, similarity) = try row.decode((UUID, String, Float).self, context: .default)
-            results.append(SearchResult(frameId: id, score: similarity, content: content))
+            let (id, content, metaJSON, similarity) = try row.decode((UUID, String, String, Float).self, context: .default)
+            let meta = Self.parseMetadata(metaJSON)
+            results.append(SearchResult(frameId: id, score: similarity, content: content, metadata: meta))
         }
         return results
     }
@@ -357,6 +361,14 @@ public actor PostgresStorageBackend: StorageBackend {
     }
 
     // MARK: - Private Helpers
+
+    private static func parseMetadata(_ json: String) -> [String: String] {
+        guard let data = json.data(using: .utf8),
+              let dict = try? JSONDecoder().decode([String: String].self, from: data) else {
+            return [:]
+        }
+        return dict
+    }
 
     private func vectorLiteral(_ v: [Float]) -> String {
         "[" + v.map { String($0) }.joined(separator: ",") + "]"
